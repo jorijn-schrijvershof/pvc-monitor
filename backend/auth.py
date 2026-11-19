@@ -193,13 +193,13 @@ async def callback(request: Request):
         token = await oauth.dex.authorize_access_token(request, claims_options=claims_options())
     except Exception as exc:
         logger.warning("Auth: token exchange failed: %r", str(exc))
-        return RedirectResponse(url="/auth/login")
+        return _sign_in_failed(request)
 
     # Only claims from a validated ID token are trusted.
     userinfo = token.get("userinfo")
     if not userinfo:
         logger.warning("Auth: token response has no validated ID token")
-        return RedirectResponse(url="/auth/login")
+        return _sign_in_failed(request)
 
     email = userinfo.get("email") or ""
     name = userinfo.get("name") or userinfo.get("preferred_username") or email
@@ -237,31 +237,18 @@ async def logout(request: Request):
     return RedirectResponse(url="/auth/login" if auth_active() else "/")
 
 
-# The page carries its own inline <style>, so it gets its own policy.
+# The pages carry their own inline <style>, so they get their own policy.
 _FORBIDDEN_CSP = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'"
 
 
-@router.get("/auth/forbidden")
-async def forbidden(request: Request):
-    denied = request.session.pop("denied", None)
-    if isinstance(denied, dict):
-        email   = html.escape(str(denied.get("email") or "unknown"))
-        groups  = html.escape(", ".join(_string_list(denied.get("groups"))) or "none")
-        allowed = html.escape(", ".join(sorted(ALLOWED_GROUPS)) or "—")
-        details = f"""
-    <p>Signed in as <span class="tag">{email}</span></p>
-    <p>You are not a member of any group that is allowed to access this application.</p>
-    <p style="margin-top:20px">
-      Your groups: <span class="tag">{groups}</span><br><br>
-      Allowed groups: <span class="tag">{allowed}</span>
-    </p>"""
-    else:
-        details = "\n    <p>You do not have access to this application.</p>"
+def _page(title: str, heading: str, details: str, link_url: str, link_text: str, status_code: int) -> HTMLResponse:
+    """A small stand-alone page. title, heading and link_text are fixed text;
+    details is markup the caller has escaped; link_url is escaped here."""
     page = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Access Denied — PVC Monitor</title>
+  <title>{title} — PVC Monitor</title>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
            background: #0d1117; color: #e6edf3; display: flex; align-items: center;
@@ -281,15 +268,44 @@ async def forbidden(request: Request):
 </head>
 <body>
   <div class="card">
-    <h1>&#x26D4; Access Denied</h1>{details}
-    <a href="/auth/logout">Sign out and try a different account</a>
+    <h1>{heading}</h1>{details}
+    <a href="{html.escape(link_url)}">{link_text}</a>
   </div>
 </body>
 </html>"""
-    return HTMLResponse(
-        content=page, status_code=403,
-        headers={"Content-Security-Policy": _FORBIDDEN_CSP},
+    return HTMLResponse(content=page, status_code=status_code, headers={"Content-Security-Policy": _FORBIDDEN_CSP})
+
+
+def _sign_in_failed(request: Request) -> HTMLResponse:
+    """Shown instead of redirecting to the login again, which can loop when the
+    issuer is misconfigured. The retry link keeps the page the user asked for."""
+    next_url = _safe_next(request.session.get("next", "/"))
+    return _page(
+        "Sign-in failed", "Sign-in failed",
+        "\n    <p>The sign-in could not be completed. If this keeps happening, the identity "
+        "provider settings may be wrong; the server log has the details.</p>",
+        "/auth/login?next=" + quote(next_url, safe=""), "Try again", 400,
     )
+
+
+@router.get("/auth/forbidden")
+async def forbidden(request: Request):
+    denied = request.session.pop("denied", None)
+    if isinstance(denied, dict):
+        email   = html.escape(str(denied.get("email") or "unknown"))
+        groups  = html.escape(", ".join(_string_list(denied.get("groups"))) or "none")
+        allowed = html.escape(", ".join(sorted(ALLOWED_GROUPS)) or "—")
+        details = f"""
+    <p>Signed in as <span class="tag">{email}</span></p>
+    <p>You are not a member of any group that is allowed to access this application.</p>
+    <p style="margin-top:20px">
+      Your groups: <span class="tag">{groups}</span><br><br>
+      Allowed groups: <span class="tag">{allowed}</span>
+    </p>"""
+    else:
+        details = "\n    <p>You do not have access to this application.</p>"
+    return _page("Access Denied", "&#x26D4; Access Denied", details,
+                 "/auth/logout", "Sign out and try a different account", 403)
 
 
 @router.get("/auth/user")

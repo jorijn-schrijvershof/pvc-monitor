@@ -6,11 +6,12 @@ import ssl
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 from pyVim.connect import SmartConnect, Disconnect
-from pyVmomi import vim
+from pyVmomi import SoapStubAdapter, vim
 
-from settings import Unavailable, env_bool, env_int, env_str
+from settings import Unavailable, env_bool, env_float, env_int, env_list, env_str
 
 logger = logging.getLogger(__name__)
 
@@ -150,47 +151,56 @@ def check_connectivity() -> dict:
 
 
 VSPHERE_CSI_DRIVER = "csi.vsphere.vmware.com"
+IN_TREE_DRIVER = "kubernetes.io/vsphere-volume"
+
+# Datastore names to scan; empty scans every datastore the account can see.
+VCENTER_DATASTORES = env_list("VCENTER_DATASTORES")
+# Ask Cloud Native Storage which cluster each disk belongs to.
+VCENTER_CNS_ENABLED = env_bool("VCENTER_CNS_ENABLED", True)
+# A disk younger than this is never actionable: its PV may not exist yet.
+UNCLAIMED_MIN_AGE_HOURS = env_float("UNCLAIMED_MIN_AGE_HOURS", 24, minimum=0)
+CNS_PAGE_SIZE = 500
+
+# Name the vSphere CSI driver gives a dynamically provisioned disk (its PV name).
+_CSI_NAME_RE = re.compile(r"^pvc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+_VM_SCAN_PROBLEM = "The VM scan failed or was incomplete; attachment is unknown for disks not found on a VM"
+_CNS_PROBLEM = "Cloud Native Storage could not be queried; CNS state is unknown for every disk"
+_CNS_EMPTY_PROBLEM = ("Cloud Native Storage knows none of the disks that configured clusters claim; "
+                      "CNS state is treated as unknown for every disk")
 
 
-def _get_vsphere_pv_maps() -> tuple[dict, dict]:
-    """
-    Build lookup maps for matching vSphere FCDs to Kubernetes PVs.
+# ── Kubernetes claims ────────────────────────────────────────────────────────
 
-    Returns:
-        term_to_pv  – any search term (lower) → PV dict.
-                      Indexed by: PV name AND PVC name so that FCD display names
-                      set to either convention are found.
-        handle_to_pv – volumeHandle (lower) → PV dict, for UUID-based matching.
+def _claims() -> tuple[dict, dict]:
+    """PVs of all configured clusters that can claim an FCD, keyed for lookup.
 
-    Deduplication key: volume_handle (used in `seen` sets throughout).
+    by_handle: CSI volumeHandle (lower) -> PVs; the handle is the FCD id.
+    by_path:   in-tree vsphereVolume volumePath (lower) -> PVs; compared with
+               the FCD backing file path.
+    Raises (naming the cluster) when any cluster's PV list is incomplete.
     """
     import k8s_client
-    pvs = k8s_client.get_k8s_persistent_volumes()
-    term_to_pv: dict = {}
-    handle_to_pv: dict = {}
-    for pv in pvs:
-        if pv.get("driver") != VSPHERE_CSI_DRIVER:
+    by_handle: dict = {}
+    by_path: dict = {}
+    for pv in k8s_client.get_pvs_of_all_clusters():
+        key = (pv.get("volume_handle") or "").strip().lower()
+        if not key:
             continue
-        pv_name = (pv.get("name") or "").lower()
-        handle = (pv.get("volume_handle") or "").lower()
-        # claim_ref is "namespace/pvc-name" — extract just the PVC name
-        claim_ref = pv.get("claim_ref") or ""
-        pvc_name = claim_ref.split("/")[-1].lower() if "/" in claim_ref else ""
-
-        if pv_name:
-            term_to_pv[pv_name] = pv
-        # Index by PVC name too; don't overwrite if PV name already claimed the slot
-        if pvc_name and pvc_name not in term_to_pv:
-            term_to_pv[pvc_name] = pv
-        if handle:
-            handle_to_pv[handle] = pv
-    return term_to_pv, handle_to_pv
+        if pv.get("driver") == VSPHERE_CSI_DRIVER:
+            by_handle.setdefault(key, []).append(pv)
+        elif pv.get("driver") == IN_TREE_DRIVER:
+            by_path.setdefault(key, []).append(pv)
+    return by_handle, by_path
 
 
-def _pv_key(pv: dict) -> str:
-    """Canonical dedup key for a PV — volume_handle, falling back to PV name."""
-    return (pv.get("volume_handle") or pv.get("name") or "").lower()
+def _claiming_pvs(fcd: dict, claims: tuple[dict, dict]) -> list[dict]:
+    """PVs that claim this FCD: by UUID, or for in-tree PVs by exact file path. Never by name."""
+    by_handle, by_path = claims
+    return by_handle.get(fcd["id"], []) + by_path.get(fcd["file_path"].strip().lower(), [])
 
+
+# ── vCenter inventory ────────────────────────────────────────────────────────
 
 def _ds_label(ds) -> str:
     """Safe datastore label that never triggers a permission-gated property fetch."""
@@ -203,11 +213,12 @@ def _ds_label(ds) -> str:
             return str(ds)
 
 
-def _build_vm_attachment_index(content) -> tuple[dict, dict]:
+def _build_vm_attachment_index(content) -> tuple[dict, dict, bool]:
     """
-    Scan every VM and return two lookup dicts:
+    Scan every VM and return (obj_id_index, filepath_index, complete):
         obj_id_index   – backingObjectId (lower) → vm_info
         filepath_index – fileName (lower)        → vm_info
+        complete       – False when the scan or any VM could not be read
 
     filepath_index is keyed by BOTH the actual fileName AND (when the disk is a
     snapshot delta) the derived base path, so FCD catalog entries can match VMs
@@ -215,6 +226,7 @@ def _build_vm_attachment_index(content) -> tuple[dict, dict]:
     """
     obj_id_index: dict = {}
     filepath_index: dict = {}
+    complete = True
     try:
         with _container_view(content, vim.VirtualMachine) as vm_view:
             for vm in vm_view:
@@ -245,97 +257,213 @@ def _build_vm_attachment_index(content) -> tuple[dict, dict]:
                             if base:
                                 filepath_index[base] = vm_info
                 except Exception:
-                    continue
+                    logger.warning("vCenter: reading the disks of a VM failed", exc_info=True)
+                    complete = False
     except Exception:
-        pass
-    return obj_id_index, filepath_index
+        logger.exception("vCenter: the VM scan failed")
+        complete = False
+    return obj_id_index, filepath_index, complete
 
 
-def _scan_fcd_catalog(content, term_to_pv: dict, handle_to_pv: dict,
-                      seen: set, obj_id_index: dict, filepath_index: dict) -> list[dict]:
+def _attachment(fcd: dict, vm_index) -> tuple[dict | None, str]:
+    """(vm_info, "yes" | "no" | "unknown"). "no" only after a complete VM scan."""
+    obj_ids, paths, complete = vm_index
+    vm = obj_ids.get(fcd["id"]) or obj_ids.get(_nodash(fcd["id"])) or paths.get(fcd["file_path"].lower())
+    if vm:
+        return vm, "yes"
+    return None, "no" if complete else "unknown"
+
+
+def _log_list_failure(ds_name: str, exc: Exception) -> None:
+    if isinstance(exc, vim.fault.NoPermission):
+        logger.error(
+            "vCenter: the account may not list First Class Disks on datastore %r. "
+            "ListVStorageObject needs Datastore.FileManagement (Low level file operations) "
+            "on the datastore; see 'Required vCenter privileges' in the README", ds_name,
+        )
+    else:
+        logger.warning("vCenter: listing First Class Disks on datastore %r failed", ds_name, exc_info=True)
+
+
+def _scan_catalog(content) -> tuple[list[dict], list[str]]:
+    """Every FCD on the scanned datastores, plus a list of problems.
+
+    The catalogue is the source of what exists. A datastore that cannot be
+    listed and an FCD that cannot be retrieved are recorded as problems, never
+    skipped silently. Raises Unavailable when no datastore could be listed at all.
     """
-    Iterate the FCD catalog across all accessible datastores and match each FCD
-    to a K8s PV.  Matching order:
-      1. FCD display name == PV name  (CSI driver default)
-      2. FCD display name == PVC name (some CSI configurations)
-      3. FCD UUID         == volumeHandle
+    problems: list[str] = []
+    fcds: list[dict] = []
+    vsom = content.vStorageObjectManager
+    with _container_view(content, vim.Datastore) as ds_view:
+        datastores = [(_ds_label(ds), ds) for ds in ds_view]
+    if VCENTER_DATASTORES:
+        found = {name for name, _ in datastores}
+        problems += [f"Datastore {name} from VCENTER_DATASTORES was not found"
+                     for name in VCENTER_DATASTORES if name not in found]
+        datastores = [(name, ds) for name, ds in datastores if name in VCENTER_DATASTORES]
 
-    Annotates each result with attached node VM data from the index.
-    Skips datastores where the account lacks Datastore.FileManagement, which
-    ListVStorageObject and RetrieveVStorageObject require.
+    listed = 0
+    for ds_name, ds in datastores:
+        try:
+            refs = vsom.ListVStorageObject(ds)
+        except Exception as exc:
+            _log_list_failure(ds_name, exc)
+            problems.append(f"Datastore {ds_name}: First Class Disks could not be listed")
+            continue
+        listed += 1
+        for ref in refs or []:
+            ref_id = getattr(ref, "id", ref)
+            try:
+                cfg = vsom.RetrieveVStorageObject(ref, ds).config
+                backing = getattr(cfg, "backing", None)
+                fcds.append({
+                    "id": (cfg.id.id or "").lower(),
+                    "fcd_id": cfg.id.id,
+                    "name": getattr(cfg, "name", "") or "",
+                    "datastore": ds_name,
+                    "capacity_gb": round((getattr(cfg, "capacityInMB", 0) or 0) / 1024, 2),
+                    "file_path": (getattr(backing, "filePath", "") if backing else "") or "",
+                    "created": getattr(cfg, "createTime", None),
+                    "ref": ref,
+                    "ds": ds,
+                })
+            except Exception:
+                logger.warning("vCenter: retrieving disk %s on datastore %r failed", ref_id, ds_name, exc_info=True)
+                problems.append(f"Datastore {ds_name}: disk {ref_id} could not be retrieved")
+
+    if not listed:
+        raise Unavailable(
+            "No datastore could be listed in vCenter, so no result is produced. Check the account's "
+            "Datastore.FileManagement privilege and VCENTER_DATASTORES; see the server log."
+        )
+    return fcds, problems
+
+
+# ── Cloud Native Storage ─────────────────────────────────────────────────────
+
+def _query_cns_volumes(si) -> dict[str, str]:
+    """FCD id (lower) -> CNS container cluster-id ("" when CNS has none), for every
+    volume Cloud Native Storage knows.
+
+    NOT TESTED AGAINST A LIVE vCENTER. The method, types, paging and privilege come
+    from the pyVmomi 9.1.1.0 type definitions (_typeinfo_vsanhealth.py):
+    vim.cns.VolumeManager.Query is CnsQueryVolume (since vsan.version.version11,
+    privilege Cns.Searchable), paged with vim.cns.QueryFilter.cursor. pyVmomi does
+    not say where the service lives: the /vsanHealth path and the managed object id
+    "cns-volume-manager" are taken from govmomi's cns/client.go, which reaches the
+    service through the logged-in vCenter session; reusing the session cookie here
+    follows that, but is not tested. govmomi asks for the vCenter's current vSAN
+    API version; this uses version11, the lowest that has Query. Read-only: only
+    Query is called.
     """
-    volumes: list = []
+    stub = SoapStubAdapter(
+        host=VCENTER_HOST,
+        port=VCENTER_PORT,
+        path="/vsanHealth",
+        version="vsan.version.version11",  # the lowest version that has Query
+        sslContext=_ssl_context(),
+        httpConnectionTimeout=VCENTER_TIMEOUT_SECONDS,
+    )
+    stub.cookie = si._stub.cookie  # the logged-in vCenter session
     try:
-        vsom = content.vStorageObjectManager
-        with _container_view(content, vim.Datastore) as ds_view:
-            for ds in ds_view:
-                ds_id = _ds_label(ds)
-                try:
-                    refs = vsom.ListVStorageObject(ds)
-                except Exception:
-                    continue
-                for ref in refs:
-                    try:
-                        obj = vsom.RetrieveVStorageObject(ref, ds)
-                        cfg = obj.config
-                        fcd_name = (getattr(cfg, "name", None) or "").lower()
-                        fcd_id = (cfg.id.id or "").lower()
+        manager = vim.cns.VolumeManager("cns-volume-manager", stub)
+        volumes: dict[str, str] = {}
+        offset = 0
+        while True:
+            page = manager.Query(vim.cns.QueryFilter(cursor=vim.cns.Cursor(offset=offset, limit=CNS_PAGE_SIZE)))
+            for vol in page.volumes or []:
+                cluster = getattr(getattr(vol, "metadata", None), "containerCluster", None)
+                volumes[vol.volumeId.id.lower()] = (getattr(cluster, "clusterId", None) or "").strip()
+            total = page.cursor.totalRecords
+            if not page.volumes or (total is not None and page.cursor.offset >= total):
+                return volumes
+            if page.cursor.offset <= offset:
+                raise RuntimeError("CNS query cursor did not advance")
+            offset = page.cursor.offset
+    finally:
+        stub.DropConnections()
 
-                        pv = term_to_pv.get(fcd_name) or handle_to_pv.get(fcd_id)
-                        if not pv:
-                            continue
 
-                        key = _pv_key(pv)
-                        if key in seen:
-                            continue
-                        seen.add(key)
+# ── Classification ───────────────────────────────────────────────────────────
 
-                        fcd_backing = getattr(cfg, "backing", None)
-                        fcd_file_path = (
-                            getattr(fcd_backing, "filePath", "") if fcd_backing else ""
-                        ) or ""
+CATEGORIES = ("inconsistent", "orphan_known_to_cns", "foreign", "candidate", "unknown")
+ACTIONABLE_CATEGORIES = ("candidate", "orphan_known_to_cns")
 
-                        vm_info = (
-                            obj_id_index.get(fcd_id)
-                            or obj_id_index.get(_nodash(fcd_id))
-                            or filepath_index.get(fcd_file_path.lower())
-                        )
 
-                        volumes.append({
-                            "volume_id": pv.get("volume_handle") or cfg.id.id,
-                            "pv_name": pv["name"],
-                            "claim": pv.get("claim_ref") or "—",
-                            "capacity_gb": (
-                                (vm_info or {}).get("capacity_gb")
-                                or round(getattr(cfg, "capacityInMB", 0) / 1024, 2)
-                            ),
-                            "datastore": (vm_info or {}).get("datastore") or ds_id,
-                            "file_path": (vm_info or {}).get("file_path") or fcd_file_path or "N/A",
-                            "vm_name": (vm_info or {}).get("vm_name") or "—",
-                            "vm_power_state": (vm_info or {}).get("vm_power_state") or "—",
-                            "storage_class": pv.get("storage_class") or "—",
-                            "k8s_status": pv.get("status") or "—",
-                        })
-                    except Exception:
-                        continue
-    except Exception:
-        pass
-    return volumes
+def classify(claims: list[tuple[str, bool]], cns, clusters) -> tuple[str, str]:
+    """Category and reason for one FCD. Pure; uncertainty never promotes a disk.
 
+    claims:   (cluster name, is CSI claim) for every PV that claims the disk
+    cns:      None = CNS state unknown, False = not known to CNS,
+              str = the CNS cluster-id ("" when CNS records none)
+    clusters: the configured clusters (name, csi_cluster_id)
+    """
+    ids = {c.csi_cluster_id: c.name for c in clusters if c.csi_cluster_id}
+    if claims:
+        if len(claims) > 1:
+            return "inconsistent", "claimed by more than one PV"
+        holder, is_csi = claims[0]
+        if cns is None or not is_csi:
+            return "in_use", ""
+        if cns is False:
+            return "inconsistent", f"claimed in cluster {holder} but not known to CNS"
+        holder_id = next((c.csi_cluster_id for c in clusters if c.name == holder), None)
+        if holder_id and cns and cns != holder_id:
+            return "inconsistent", f"claimed in cluster {holder} but CNS records cluster-id {cns}"
+        return "in_use", ""
+    if cns is None:
+        return "unknown", "CNS state unknown"
+    if cns is False:
+        return "candidate", "not claimed by any configured cluster and not known to CNS"
+    if cns in ids:
+        return "orphan_known_to_cns", f"CNS records configured cluster {ids[cns]}, which has no PV for it"
+    if cns and all(c.csi_cluster_id for c in clusters):
+        return "foreign", f"CNS records cluster-id {cns}, which is not a configured cluster"
+    return "unknown", "CNS cluster-id cannot be matched (not every configured cluster has a csi_cluster_id)"
+
+
+def _age_hours(created, now: datetime) -> float | None:
+    if not isinstance(created, datetime) or created.tzinfo is None:
+        return None
+    return round((now - created).total_seconds() / 3600, 1)
+
+
+# ── Public scans ─────────────────────────────────────────────────────────────
 
 @_single_flight
-def get_persistent_volumes() -> list[dict]:
-    term_to_pv, handle_to_pv = _get_vsphere_pv_maps()
-    if not term_to_pv:
-        return []
+def get_persistent_volumes() -> dict:
+    """FCDs claimed by a PV of any configured cluster, matched by UUID only."""
+    claims = _claims()
+    if not any(claims):
+        return {"volumes": [], "complete": True, "problems": []}
 
     with _session() as si:
         content = si.RetrieveContent()
-        obj_id_index, filepath_index = _build_vm_attachment_index(content)
-        return _scan_fcd_catalog(
-            content, term_to_pv, handle_to_pv,
-            set(), obj_id_index, filepath_index,
-        )
+        vm_index = _build_vm_attachment_index(content)
+        fcds, problems = _scan_catalog(content)
+    if not vm_index[2]:
+        problems.append(_VM_SCAN_PROBLEM)
+
+    volumes = []
+    for fcd in fcds:
+        for pv in _claiming_pvs(fcd, claims):
+            vm, attached = _attachment(fcd, vm_index)
+            volumes.append({
+                "cluster": pv["cluster"],
+                "volume_id": fcd["fcd_id"],
+                "pv_name": pv["name"],
+                "claim": pv.get("claim_ref") or "—",
+                "capacity_gb": fcd["capacity_gb"],
+                "datastore": fcd["datastore"],
+                "file_path": fcd["file_path"] or "N/A",
+                "attached": attached,
+                "vm_name": (vm or {}).get("vm_name") or "—",
+                "vm_power_state": (vm or {}).get("vm_power_state") or "—",
+                "storage_class": pv.get("storage_class") or "—",
+                "k8s_status": pv.get("status") or "—",
+            })
+    return {"volumes": volumes, "complete": not problems, "problems": problems}
 
 
 @_single_flight
@@ -432,186 +560,180 @@ def get_snapshots() -> list[dict]:
     vm.snapshot on node VMs remains None.
 
     The correct vSphere API is vsom.RetrieveSnapshotInfo(fcd_id, datastore).
+    Disks are matched to PVs by UUID only.
     """
-    term_to_pv, handle_to_pv = _get_vsphere_pv_maps()
-    if not term_to_pv and not handle_to_pv:
+    claims = _claims()
+    if not any(claims):
         return []
-
-    search_terms = set(term_to_pv.keys())
 
     with _session() as si:
         content = si.RetrieveContent()
+        fcds, problems = _scan_catalog(content)
+        vsom = content.vStorageObjectManager
         all_snapshots = []
-        try:
-            vsom = content.vStorageObjectManager
-            with _container_view(content, vim.Datastore) as ds_view:
-                for ds in ds_view:
-                    ds_id = _ds_label(ds)
-                    try:
-                        refs = vsom.ListVStorageObject(ds)
-                    except Exception:
-                        continue
-                    for ref in refs:
-                        try:
-                            obj = vsom.RetrieveVStorageObject(ref, ds)
-                            cfg = obj.config
-                            fcd_name = (getattr(cfg, "name", None) or "").lower()
-                            fcd_id   = (cfg.id.id or "").lower()
-
-                            pv = term_to_pv.get(fcd_name) or handle_to_pv.get(fcd_id)
-                            if not pv:
-                                continue
-
-                            # Query FCD-level snapshots
-                            try:
-                                snap_info = vsom.RetrieveSnapshotInfo(ref, ds)
-                            except Exception:
-                                continue
-                            if not snap_info or not getattr(snap_info, "snapshots", None):
-                                continue
-
-                            claim_ref = pv.get("claim_ref") or ""
-                            pvc_name  = claim_ref.split("/")[-1] if "/" in claim_ref else claim_ref
-
-                            for snap in snap_info.snapshots:
-                                try:
-                                    snap_id = snap.id.id if hasattr(snap.id, "id") else str(snap.id)
-                                except Exception:
-                                    snap_id = "—"
-                                try:
-                                    created = snap.createTime.isoformat() if getattr(snap, "createTime", None) else None
-                                except Exception:
-                                    created = None
-                                all_snapshots.append({
-                                    "pv_name":       pv["name"],
-                                    "pvc_name":      pvc_name or "—",
-                                    "volume_handle": pv.get("volume_handle") or "—",
-                                    "snapshot_id":   snap_id,
-                                    "description":   getattr(snap, "description", "") or "",
-                                    "created":       created,
-                                    "datastore":     ds_id,
-                                    "storage_class": pv.get("storage_class") or "—",
-                                })
-                        except Exception:
-                            continue
-        except Exception:
-            pass
-        return all_snapshots
+        for fcd in fcds:
+            pvs = _claiming_pvs(fcd, claims)
+            if not pvs:
+                continue
+            try:
+                snap_info = vsom.RetrieveSnapshotInfo(fcd["ref"], fcd["ds"])
+            except Exception:
+                logger.warning("vCenter: reading snapshots of disk %s failed", fcd["fcd_id"], exc_info=True)
+                problems.append(f"Disk {fcd['fcd_id']}: snapshots could not be read")
+                continue
+            for snap in getattr(snap_info, "snapshots", None) or []:
+                try:
+                    snap_id = snap.id.id if hasattr(snap.id, "id") else str(snap.id)
+                except Exception:
+                    snap_id = "—"
+                try:
+                    created = snap.createTime.isoformat() if getattr(snap, "createTime", None) else None
+                except Exception:
+                    created = None
+                for pv in pvs:
+                    claim_ref = pv.get("claim_ref") or ""
+                    all_snapshots.append({
+                        "cluster":       pv["cluster"],
+                        "pv_name":       pv["name"],
+                        "pvc_name":      claim_ref.split("/")[-1] if claim_ref else "—",
+                        "volume_handle": pv.get("volume_handle") or "—",
+                        "snapshot_id":   snap_id,
+                        "description":   getattr(snap, "description", "") or "",
+                        "created":       created,
+                        "datastore":     fcd["datastore"],
+                        "storage_class": pv.get("storage_class") or "—",
+                    })
+    # Snapshot scan problems are logged only; the view and the snapshot alert get the list.
+    for problem in problems:
+        logger.warning("vCenter: snapshot scan incomplete: %s", problem)
+    return all_snapshots
 
 
 @_single_flight
-def get_orphaned_fcds() -> list[dict]:
+def get_orphaned_fcds() -> dict:
     """
-    FCDs in the vSphere catalog that have no corresponding Kubernetes PV.
+    FCDs that no configured cluster claims, each with a category and safeguards.
 
-    A K8s PV's spec.csi.volumeHandle is the FCD UUID. Any FCD whose UUID is
-    not in that set is either:
-      - A CSI volume whose PV was deleted (Retain policy → FCD stays on disk)
-      - A pre-existing / non-CSI FCD (check fcd_name for clues)
-      - A genuinely leaked volume
-
-    Raises RuntimeError when K8s is not configured, because without the list of
-    claimed handles we cannot determine which FCDs are orphaned.
+    Fails closed: if the PV list of any configured cluster cannot be read,
+    raise instead of producing a result. Gaps on the vSphere side (datastores,
+    disks, VM scan, CNS) are returned as problems with complete=False.
     """
     import k8s_client
-
-    pvs = k8s_client.get_k8s_persistent_volumes()   # raises RuntimeError if not configured
-    claimed = {
-        pv["volume_handle"].lower()
-        for pv in pvs
-        if pv.get("driver") == VSPHERE_CSI_DRIVER and pv.get("volume_handle")
-    }
+    clusters = k8s_client.CLUSTERS
+    claims = _claims()
 
     with _session() as si:
         content = si.RetrieveContent()
-        obj_id_index, filepath_index = _build_vm_attachment_index(content)
+        vm_index = _build_vm_attachment_index(content)
+        fcds, problems = _scan_catalog(content)
+        cns = None
+        cns_state = "disabled"
+        if VCENTER_CNS_ENABLED:
+            try:
+                cns = _query_cns_volumes(si)
+                cns_state = "ok"
+            except Exception:
+                logger.exception("vCenter: the Cloud Native Storage query failed")
+                cns_state = "failed"
+                problems.append(_CNS_PROBLEM)
+    if not vm_index[2]:
+        problems.append(_VM_SCAN_PROBLEM)
 
-        orphans: list[dict] = []
-        try:
-            vsom = content.vStorageObjectManager
-            with _container_view(content, vim.Datastore) as ds_view:
-                for ds in ds_view:
-                    ds_id = _ds_label(ds)
-                    try:
-                        refs = vsom.ListVStorageObject(ds)
-                    except Exception:
-                        continue
-                    for ref in refs:
-                        try:
-                            obj = vsom.RetrieveVStorageObject(ref, ds)
-                            cfg = obj.config
-                            fcd_id = (cfg.id.id or "").lower()
+    # An answer that knows none of the CSI-claimed disks (for example an empty
+    # result for lack of a privilege) would turn every unclaimed disk into a
+    # candidate. Treat it as unknown instead.
+    if cns is not None:
+        csi_claimed = [f for f in fcds if f["id"] in claims[0]]
+        if csi_claimed and not any(f["id"] in cns for f in csi_claimed):
+            logger.warning("vCenter: CNS knows none of the %d claimed disks; treating CNS state as unknown", len(csi_claimed))
+            cns, cns_state = None, "failed"
+            problems.append(_CNS_EMPTY_PROBLEM)
 
-                            if fcd_id in claimed:
-                                continue  # claimed by a K8s PV — not orphaned
-
-                            fcd_backing  = getattr(cfg, "backing", None)
-                            fcd_file_path = (
-                                getattr(fcd_backing, "filePath", "") if fcd_backing else ""
-                            ) or ""
-
-                            vm_info = (
-                                obj_id_index.get(fcd_id)
-                                or obj_id_index.get(_nodash(fcd_id))
-                                or filepath_index.get(fcd_file_path.lower())
-                            )
-
-                            try:
-                                ds_name = ds.name
-                            except Exception:
-                                ds_name = ds_id
-
-                            orphans.append({
-                                "fcd_id":        cfg.id.id,
-                                "fcd_name":      getattr(cfg, "name", "") or "—",
-                                "datastore":     ds_name,
-                                "capacity_gb":   round(getattr(cfg, "capacityInMB", 0) / 1024, 2),
-                                "file_path":     fcd_file_path or "—",
-                                "vm_name":       (vm_info or {}).get("vm_name") or "—",
-                                "vm_power_state": (vm_info or {}).get("vm_power_state") or "—",
-                            })
-                        except Exception:
-                            continue
-        except Exception:
-            pass
-
-        return orphans
+    now = datetime.now(timezone.utc)
+    counts = {key: 0 for key in ("in_use", *CATEGORIES, "actionable")}
+    disks = []
+    for fcd in fcds:
+        claiming = _claiming_pvs(fcd, claims)
+        cns_id = None if cns is None else cns.get(fcd["id"], False)
+        category, reason = classify(
+            [(pv["cluster"], pv.get("driver") == VSPHERE_CSI_DRIVER) for pv in claiming], cns_id, clusters,
+        )
+        counts[category] += 1
+        if category == "in_use":
+            continue
+        vm, attached = _attachment(fcd, vm_index)
+        age = _age_hours(fcd["created"], now)
+        too_young = None if age is None else age < UNCLAIMED_MIN_AGE_HOURS
+        actionable = (
+            category in ACTIONABLE_CATEGORIES and attached == "no" and too_young is False
+        )
+        counts["actionable"] += actionable
+        cns_cluster = next((c.name for c in clusters if cns_id and c.csi_cluster_id == cns_id), None)
+        disks.append({
+            "fcd_id":         fcd["fcd_id"],
+            "fcd_name":       fcd["name"] or "—",
+            "datastore":      fcd["datastore"],
+            "capacity_gb":    fcd["capacity_gb"],
+            "file_path":      fcd["file_path"] or "—",
+            "category":       category,
+            "reason":         reason,
+            "claimed_by":     sorted({pv["cluster"] for pv in claiming}),
+            "cns_known":      None if cns_id is None else cns_id is not False,
+            "cns_cluster_id": cns_id or None,
+            "cns_cluster":    cns_cluster,
+            "attached":       attached,
+            "vm_name":        (vm or {}).get("vm_name") or "—",
+            "vm_power_state": (vm or {}).get("vm_power_state") or "—",
+            "created":        fcd["created"].isoformat() if age is not None else None,
+            "age_hours":      age,
+            "too_young":      too_young,
+            "looks_like_csi": bool(_CSI_NAME_RE.match(fcd["name"])),
+            "actionable":     actionable,
+        })
+    disks.sort(key=lambda d: (not d["actionable"], -d["capacity_gb"]))
+    return {
+        "disks": disks,
+        "counts": counts,
+        "complete": not problems,
+        "problems": problems,
+        "cns": cns_state,
+        "clusters": [{"name": c.name, "csi_cluster_id": c.csi_cluster_id} for c in clusters],
+        "min_age_hours": UNCLAIMED_MIN_AGE_HOURS,
+        "scanned_at": now.isoformat(),
+    }
 
 
 def get_container_volumes() -> list[dict]:
     """
-    Return PVCs backed by the vSphere CSI driver, sourced from Kubernetes.
-
-    CNS is not required. The standalone vSphere CSI driver provisions FCDs
-    directly; PVCs are the Kubernetes view of those volumes.
+    Return PVCs backed by the vSphere CSI driver in every configured cluster,
+    sourced from Kubernetes. Fails closed, naming the cluster that could not be read.
     """
     import k8s_client
 
-    pvs = k8s_client.get_k8s_persistent_volumes()
-    vsphere_pv_map = {
-        pv["name"]: pv
-        for pv in pvs
-        if pv.get("driver") == VSPHERE_CSI_DRIVER
-    }
-    if not vsphere_pv_map:
-        return []
+    def read(cluster):
+        pvs = k8s_client.get_k8s_persistent_volumes(cluster)
+        vsphere_pv_map = {pv["name"]: pv for pv in pvs if pv.get("driver") == VSPHERE_CSI_DRIVER}
+        pvcs = k8s_client.get_k8s_persistent_volume_claims(cluster) if vsphere_pv_map else []
+        return vsphere_pv_map, pvcs
 
-    pvcs = k8s_client.get_k8s_persistent_volume_claims()
     result = []
-    for pvc in pvcs:
-        pv_name = pvc.get("volume_name") or ""
-        if pv_name not in vsphere_pv_map:
-            continue
-        pv = vsphere_pv_map[pv_name]
-        result.append({
-            "name": pvc["name"],
-            "namespace": pvc["namespace"],
-            "pv_name": pv_name,
-            "volume_handle": pv.get("volume_handle") or "—",
-            "capacity": pvc.get("capacity") or pv.get("capacity") or "—",
-            "status": pvc.get("status") or "—",
-            "storage_class": pvc.get("storage_class") or "—",
-            "access_modes": pvc.get("access_modes") or [],
-            "created": pvc.get("created"),
-        })
+    for cluster in k8s_client.CLUSTERS:
+        vsphere_pv_map, pvcs = k8s_client.read_cluster(cluster, read)
+        for pvc in pvcs:
+            pv_name = pvc.get("volume_name") or ""
+            if pv_name not in vsphere_pv_map:
+                continue
+            pv = vsphere_pv_map[pv_name]
+            result.append({
+                "cluster": cluster.name,
+                "name": pvc["name"],
+                "namespace": pvc["namespace"],
+                "pv_name": pv_name,
+                "volume_handle": pv.get("volume_handle") or "—",
+                "capacity": pvc.get("capacity") or pv.get("capacity") or "—",
+                "status": pvc.get("status") or "—",
+                "storage_class": pvc.get("storage_class") or "—",
+                "access_modes": pvc.get("access_modes") or [],
+                "created": pvc.get("created"),
+            })
     return result

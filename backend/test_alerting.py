@@ -36,6 +36,27 @@ def make_snap(pvc_name: str, days_old: int) -> dict:
         "volume_handle": f"uuid-{pvc_name}",
     }
 
+def make_disk(**over) -> dict:
+    disk = {
+        "fcd_id": "fcd-1", "fcd_name": "disk", "datastore": "ds1", "capacity_gb": 10.0,
+        "category": "candidate", "cns_cluster_id": None, "cns_cluster": None,
+        "attached": "no", "age_hours": 100.0, "too_young": False, "actionable": True,
+    }
+    return {**disk, **over}
+
+
+def make_scan(disks, complete=True, problems=(), clusters=None) -> dict:
+    counts = {k: 0 for k in ("in_use", "inconsistent", "orphan_known_to_cns", "foreign", "candidate", "unknown")}
+    for d in disks:
+        counts[d["category"]] += 1
+    counts["actionable"] = sum(1 for d in disks if d["actionable"])
+    return {
+        "disks": disks, "counts": counts, "complete": complete, "problems": list(problems),
+        "cns": "ok", "clusters": clusters or [{"name": "a", "csi_cluster_id": "id-a"}],
+        "min_age_hours": 24, "scanned_at": "2026-01-01T00:00:00+00:00",
+    }
+
+
 SMTP_ENV = {
     "SMTP_HOST":               "smtp.example.com",
     "SMTP_PORT":               "587",
@@ -152,11 +173,42 @@ class TestComposeOrphanEmail:
             return alerting.get_config()
 
     def test_markup_in_inventory_names_is_escaped(self):
-        orphan = {"fcd_id": "id-1", "fcd_name": "<b>x</b>", "datastore": "<b>x</b>",
-                  "capacity_gb": 1.0, "vm_name": "<b>x</b>"}
-        body = html_body(alerting._compose_orphan_email(self._cfg(), [orphan]))
+        disk = make_disk(fcd_name="<b>x</b>", datastore="<b>x</b>", cns_cluster_id="<b>x</b>")
+        scan = make_scan([disk], complete=False, problems=["Datastore <b>x</b>: First Class Disks could not be listed"],
+                         clusters=[{"name": "<b>x</b>", "csi_cluster_id": None}])
+        body = html_body(alerting._compose_orphan_email(self._cfg(), scan))
         assert "&lt;b&gt;x&lt;/b&gt;" in body
         assert "<b>x</b>" not in body
+
+    def test_only_actionable_disks_listed_and_no_deletion_wording(self):
+        scan = make_scan([make_disk(fcd_id="act-1"), make_disk(fcd_id="unk-1", category="unknown", actionable=False)])
+        msg = alerting._compose_orphan_email(self._cfg(), scan)
+        body = html_body(msg)
+        assert "act-1" in body and "unk-1" not in body
+        assert "1 disk not claimed" in msg["Subject"]
+        for wording in ("safe to delete", "wasted", "orphaned"):
+            assert wording not in body.lower() and wording not in msg["Subject"].lower()
+
+    def test_incomplete_scan_stated_in_subject_and_body(self):
+        scan = make_scan([make_disk()], complete=False, problems=["Datastore ds2: First Class Disks could not be listed"])
+        msg = alerting._compose_orphan_email(self._cfg(), scan)
+        assert "INCOMPLETE" in msg["Subject"]
+        body = html_body(msg)
+        assert "scan was incomplete" in body and "ds2" in body
+
+    def test_test_mail_for_incomplete_scan_does_not_claim_none(self):
+        scan = make_scan([], complete=False, problems=["x"])
+        msg = alerting._compose_orphan_email(self._cfg(), scan, test=True)
+        body = html_body(msg)
+        assert "INCOMPLETE" in msg["Subject"] and "no disks" not in msg["Subject"]
+        assert "scan was incomplete" in body and "No disk currently meets" not in body
+
+    def test_test_mail_with_undecided_disks_does_not_claim_none(self):
+        scan = make_scan([make_disk(category="unknown", actionable=False)])
+        msg = alerting._compose_orphan_email(self._cfg(), scan, test=True)
+        body = html_body(msg)
+        assert "1 disks undecided" in msg["Subject"] and "no disks" not in msg["Subject"]
+        assert "could not be categorised" in body and "No disk currently meets" not in body
 
 
 # ── _send_email ───────────────────────────────────────────────────────────────
@@ -390,3 +442,56 @@ class TestGetStatus:
         assert status["last_check"] is not None
         assert status["last_alert"] is not None
         assert status["last_old_snap_count"] == 1
+
+
+# ── check_and_alert_orphans ───────────────────────────────────────────────────
+
+class TestCheckAndAlertOrphans:
+    def run(self, scan=None, error=None, force=False):
+        side = {"side_effect": error} if error else {"return_value": scan}
+        with patch.dict(os.environ, SMTP_ENV, clear=False), \
+             patch("vcenter_client.get_orphaned_fcds", **side), \
+             patch("alerting._send_email") as mock_send:
+            result = alerting.check_and_alert_orphans(force=force)
+        return result, mock_send
+
+    def test_actionable_disk_sends(self):
+        result, send = self.run(make_scan([make_disk()]))
+        assert result["sent"] is True and result["count"] == 1
+        send.assert_called_once()
+
+    def test_non_actionable_disks_do_not_send(self):
+        result, send = self.run(make_scan([make_disk(category="foreign", actionable=False)]))
+        assert result == {"sent": False, "reason": "no_actionable", "count": 0, "complete": True, "undecided": 0}
+        send.assert_not_called()
+        assert alerting._state_orphans["last_error"] is None
+
+    def test_incomplete_scan_is_never_none_found(self):
+        result, send = self.run(make_scan([], complete=False, problems=["x"]))
+        assert result["reason"] == "incomplete"
+        assert alerting._state_orphans["last_error"] == alerting._INCOMPLETE
+        send.assert_not_called()
+
+    def test_undecided_disks_are_never_none_found(self):
+        result, send = self.run(make_scan([make_disk(category="unknown", actionable=False)]))
+        assert result["reason"] == "undecided"
+        assert alerting._state_orphans["last_error"] == alerting._UNDECIDED
+        send.assert_not_called()
+
+    def test_incomplete_scan_with_actionable_disk_sends_and_records(self):
+        result, send = self.run(make_scan([make_disk()], complete=False, problems=["x"]))
+        assert result["sent"] is True and result["complete"] is False
+        assert alerting._state_orphans["last_error"] == alerting._INCOMPLETE
+
+    def test_cluster_failure_records_the_cluster_text(self):
+        from settings import Unavailable
+        text = "Kubernetes cluster 'b' could not be read completely. No result is produced; see the server log."
+        result, send = self.run(error=Unavailable(text))
+        assert result["reason"] == "fetch_error" and result["error"] == text
+        assert alerting._state_orphans["last_error"] == text
+        send.assert_not_called()
+
+    def test_unexpected_failure_hides_detail(self):
+        result, _ = self.run(error=RuntimeError("secret-host.internal"))
+        assert "secret-host" not in result["error"]
+        assert alerting._state_orphans["last_error"] == alerting._FETCH_ERROR

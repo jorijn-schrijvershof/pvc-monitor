@@ -66,7 +66,8 @@ def get_status() -> dict:
         "age_threshold_days":   cfg["age_threshold_days"],
         "check_interval_hours": cfg["check_interval_hours"],
         "alert_to":             cfg["alert_to"],
-        # Orphan FCD alert state (nested so it doesn't clash with snapshot fields)
+        # Unclaimed disk alert state (nested so it doesn't clash with snapshot fields);
+        # last_count is the number of actionable disks.
         "orphans": {
             "last_check": _state_orphans["last_check"].isoformat() if _state_orphans["last_check"] else None,
             "last_alert": _state_orphans["last_alert"].isoformat() if _state_orphans["last_alert"] else None,
@@ -254,39 +255,89 @@ def check_and_alert(force: bool = False) -> dict:
         return {"sent": False, "reason": "smtp_error", "error": _SMTP_ERROR, "count": len(old_snaps)}
 
 
-# ── Orphan FCD email + check ─────────────────────────────────────────────────
+# ── Unclaimed disk email + check ─────────────────────────────────────────────
 
-def _compose_orphan_email(cfg: dict, orphans: list[dict], test: bool = False) -> MIMEMultipart:
-    count = len(orphans)
+_CATEGORY_LABELS = {
+    "candidate":           "Not claimed, not known to CNS",
+    "orphan_known_to_cns": "Not claimed, CNS names a configured cluster",
+    "foreign":             "CNS names a cluster that is not configured",
+    "inconsistent":        "Claimed, but CNS disagrees",
+    "unknown":             "Cannot be decided",
+}
 
-    if test and count == 0:
-        subject = "[PVC Monitor] Test alert — no orphaned FCDs currently"
-        intro   = "This is a test email from PVC Monitor. There are currently <strong>no orphaned FCDs</strong>."
+
+def _compose_orphan_email(cfg: dict, scan: dict, test: bool = False) -> MIMEMultipart:
+    """Alert for actionable unclaimed disks; other categories as counts only."""
+    disks = [d for d in scan["disks"] if d.get("actionable")]
+    count = len(disks)
+    complete = scan.get("complete", False)
+    counts = scan.get("counts") or {}
+    undecided = counts.get("unknown", 0)
+    reliable = complete and not undecided
+    plural = "s" if count != 1 else ""
+
+    if count:
+        subject = f"[PVC Monitor] {count} disk{plural} not claimed by any configured cluster need investigation"
+    elif test and reliable:
+        subject = "[PVC Monitor] Test alert — no disks need investigation"
     else:
-        subject = f"[PVC Monitor] {count} orphaned FCD{'s' if count != 1 else ''} detected"
-        intro   = (
-            f"<strong>{count} FCD{'s' if count != 1 else ''}</strong> "
-            f"{'are' if count != 1 else 'is'} present in vSphere but not claimed by any "
-            "Kubernetes PersistentVolume. These may be leaked volumes (PV deleted with "
-            "Retain policy) or pre-existing non-CSI disks."
+        subject = "[PVC Monitor] Test alert"
+    if not complete:
+        subject += " (scan INCOMPLETE)"
+    elif undecided:
+        subject += f" ({undecided} disks undecided)"
+
+    warning = ""
+    if undecided:
+        warning += f"""
+    <div style="background:#fdf3e1;border:1px solid #e6c88a;border-radius:6px;padding:12px 16px;margin:0 0 16px">
+      <strong style="color:#a0620c">{_e(undecided)} disk{'s' if undecided != 1 else ''} could not be categorised</strong>
+      (CNS state unknown, or a CNS cluster-id that cannot be matched to a configured cluster).
+      They are not listed here and may still need investigation.
+    </div>"""
+    if not complete:
+        problems = "".join(f"<li>{_e(p)}</li>" for p in scan.get("problems") or [])
+        warning += f"""
+    <div style="background:#fdecea;border:1px solid #e0b4b4;border-radius:6px;padding:12px 16px;margin:0 0 16px">
+      <strong style="color:#c0392b">The scan was incomplete.</strong> Disks may be missing from this list
+      and the absence of a disk here means nothing.
+      <ul style="margin:8px 0 0;padding-left:20px">{problems}</ul>
+    </div>"""
+
+    if count:
+        intro = (
+            f"<strong>{count} disk{plural}</strong> on the scanned datastores {'are' if count != 1 else 'is'} "
+            "not claimed by any configured Kubernetes cluster, not attached to a VM and older than "
+            f"{_e(scan.get('min_age_hours'))} hours. Each one needs investigation; this e-mail does not "
+            "establish that a disk can be removed."
         )
+    elif reliable:
+        intro = "This is a test e-mail from PVC Monitor. No disk currently meets the alert conditions."
+    else:
+        intro = ("This is a test e-mail from PVC Monitor. No disk is listed, but the result is not "
+                 "reliable; see the warning above.")
+    count_rows = "".join(
+        f'<tr><td style="padding:4px 12px">{_e(label)}</td>'
+        f'<td style="padding:4px 12px;text-align:right">{_e(counts.get(key, 0))}</td></tr>'
+        for key, label in _CATEGORY_LABELS.items()
+    )
+    clusters = ", ".join(c["name"] for c in scan.get("clusters") or [])
 
     rows = ""
-    for o in sorted(orphans, key=lambda x: x.get("capacity_gb", 0), reverse=True):
-        attached  = o.get("vm_name") and o["vm_name"] != "—"
-        vm_style  = "color:#e67e22;font-weight:600" if attached else "color:#999"
+    for d in disks:
         rows += f"""
         <tr>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee;font-family:monospace;font-size:11px">{_e(o.get('fcd_id'))}</td>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee">{_e(o.get('fcd_name'))}</td>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee">{_e(o.get('datastore'))}</td>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee;text-align:right">{_e(o.get('capacity_gb', 0))} GB</td>
-          <td style="padding:7px 12px;border-bottom:1px solid #eee;{vm_style}">{_e(o.get('vm_name'))}</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee;font-family:monospace;font-size:11px">{_e(d.get('fcd_id'))}</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee">{_e(d.get('fcd_name'))}</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee">{_e(d.get('datastore'))}</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee;text-align:right">{_e(d.get('capacity_gb', 0))} GB</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee">{_e(d.get('age_hours'))} h</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee">{_e(_CATEGORY_LABELS.get(d.get('category'), d.get('category')))}</td>
+          <td style="padding:7px 12px;border-bottom:1px solid #eee">{_e(d.get('cns_cluster') or d.get('cns_cluster_id'))}</td>
         </tr>"""
 
     table_section = ""
     if rows:
-        total_gb = sum(o.get("capacity_gb", 0) for o in orphans)
         table_section = f"""
   <table style="width:100%;border-collapse:collapse;margin-top:20px;font-size:13px">
     <thead>
@@ -295,28 +346,27 @@ def _compose_orphan_email(cfg: dict, orphans: list[dict], test: bool = False) ->
         <th style="padding:9px 12px;border-bottom:2px solid #ddd">Name</th>
         <th style="padding:9px 12px;border-bottom:2px solid #ddd">Datastore</th>
         <th style="padding:9px 12px;border-bottom:2px solid #ddd;text-align:right">Size</th>
-        <th style="padding:9px 12px;border-bottom:2px solid #ddd">VM Attached</th>
+        <th style="padding:9px 12px;border-bottom:2px solid #ddd">Age</th>
+        <th style="padding:9px 12px;border-bottom:2px solid #ddd">Category</th>
+        <th style="padding:9px 12px;border-bottom:2px solid #ddd">CNS cluster</th>
       </tr>
     </thead>
     <tbody>{rows}</tbody>
-    <tfoot>
-      <tr style="background:#f9f9f9;font-weight:600">
-        <td colspan="3" style="padding:9px 12px;border-top:2px solid #ddd">Total wasted capacity</td>
-        <td style="padding:9px 12px;border-top:2px solid #ddd;text-align:right">{total_gb:.1f} GB</td>
-        <td style="padding:9px 12px;border-top:2px solid #ddd"></td>
-      </tr>
-    </tfoot>
   </table>"""
 
-    html = f"""<!DOCTYPE html>
+    body = f"""<!DOCTYPE html>
 <html>
 <body style="font-family:Arial,sans-serif;color:#333;max-width:960px;margin:0 auto;padding:24px;background:#fafafa">
   <div style="background:#fff;border-radius:8px;padding:28px;border:1px solid #e0e0e0">
-    <h2 style="margin:0 0 6px;color:{'#888' if test and count == 0 else '#c0392b'}">
-      {'⚙ Test Alert' if test and count == 0 else '⚠ Orphaned FCD Alert'}
+    <h2 style="margin:0 0 6px;color:{'#c0392b' if count or not reliable else '#888'}">
+      {'Disks need investigation' if count else 'Test alert'}
     </h2>
+    {warning}
     <p style="margin:0 0 16px;color:#555">{intro}</p>
     {table_section}
+    <h3 style="margin:24px 0 6px;font-size:14px">Listed disks by category</h3>
+    <table style="border-collapse:collapse;font-size:13px">{count_rows}</table>
+    <p style="margin:12px 0 0;font-size:12px;color:#555">Clusters consulted: {_e(clusters)}</p>
     <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
     <p style="margin:0;font-size:11px;color:#aaa">
       Sent by PVC Monitor &nbsp;·&nbsp; {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
@@ -329,16 +379,24 @@ def _compose_orphan_email(cfg: dict, orphans: list[dict], test: bool = False) ->
     msg["Subject"] = subject
     msg["From"]    = cfg["smtp_from"]
     msg["To"]      = ", ".join(cfg["alert_to"])
-    msg.attach(MIMEText(html, "html"))
+    msg.attach(MIMEText(body, "html"))
     return msg
+
+
+_INCOMPLETE = "the last scan was incomplete, see the Unclaimed Disks page"
+_UNDECIDED  = "some disks could not be categorised, see the Unclaimed Disks page"
 
 
 def check_and_alert_orphans(force: bool = False) -> dict:
     """
-    Fetch orphaned FCDs, send email if any are found.
+    Scan for unclaimed disks and send an e-mail when any is actionable.
     force=True always sends (used for test-alert endpoint).
+
+    A failed scan records an error; an incomplete scan is never reported as
+    "none found".
     """
     import vcenter_client  # late import — avoids circular dependency at module load
+    from settings import Unavailable
 
     cfg = get_config()
     _state_orphans["last_check"] = datetime.now(timezone.utc)
@@ -349,26 +407,42 @@ def check_and_alert_orphans(force: bool = False) -> dict:
         return {"sent": False, "reason": "not_configured", "count": 0}
 
     try:
-        orphans = vcenter_client.get_orphaned_fcds()
+        scan = vcenter_client.get_orphaned_fcds()
+    except Unavailable as exc:
+        logger.warning("Alerting: unclaimed disks, scan not possible: %s", exc)
+        _state_orphans["last_error"] = str(exc)  # text written by this application
+        return {"sent": False, "reason": "fetch_error", "error": str(exc), "count": 0}
     except Exception:
-        logger.exception("Alerting: orphans, vCenter or Kubernetes query failed")
+        logger.exception("Alerting: unclaimed disks, vCenter or Kubernetes query failed")
         _state_orphans["last_error"] = _FETCH_ERROR
         return {"sent": False, "reason": "fetch_error", "error": _FETCH_ERROR, "count": 0}
 
-    _state_orphans["last_count"] = len(orphans)
+    count = scan["counts"]["actionable"]
+    undecided = scan["counts"]["unknown"]
+    _state_orphans["last_count"] = count
+    if not scan["complete"]:
+        _state_orphans["last_error"] = _INCOMPLETE
+    elif undecided:
+        _state_orphans["last_error"] = _UNDECIDED
 
-    if not orphans and not force:
-        return {"sent": False, "reason": "no_orphans", "count": 0}
+    if not count and not force:
+        if not scan["complete"]:
+            reason = "incomplete"
+        elif undecided:
+            reason = "undecided"
+        else:
+            reason = "no_actionable"  # complete scan, every disk categorised
+        return {"sent": False, "reason": reason, "count": 0, "complete": scan["complete"], "undecided": undecided}
 
     try:
-        msg = _compose_orphan_email(cfg, orphans, test=force and not orphans)
+        msg = _compose_orphan_email(cfg, scan, test=force and not count)
         _send_email(cfg, msg)
         _state_orphans["last_alert"] = datetime.now(timezone.utc)
-        return {"sent": True, "count": len(orphans), "recipients": cfg["alert_to"]}
+        return {"sent": True, "count": count, "complete": scan["complete"], "recipients": cfg["alert_to"]}
     except Exception:
-        logger.exception("Alerting: orphans, sending the e-mail failed")
+        logger.exception("Alerting: unclaimed disks, sending the e-mail failed")
         _state_orphans["last_error"] = _SMTP_ERROR
-        return {"sent": False, "reason": "smtp_error", "error": _SMTP_ERROR, "count": len(orphans)}
+        return {"sent": False, "reason": "smtp_error", "error": _SMTP_ERROR, "count": count}
 
 
 # ── Background scheduler ─────────────────────────────────────────────────────
@@ -398,16 +472,17 @@ async def alert_scheduler() -> None:
         except Exception:
             logger.exception("Alerting: snapshots — unexpected error")
 
-        # Orphan FCD alert
+        # Unclaimed disk alert
         try:
             result = await asyncio.to_thread(check_and_alert_orphans)
             if result.get("sent"):
-                logger.info("Alerting: orphans — sent email for %d orphaned FCDs", result.get("count", 0))
-            elif result.get("reason") == "no_orphans":
-                logger.info("Alerting: orphans — no orphaned FCDs found")
+                logger.info("Alerting: unclaimed disks — sent email for %d disks needing investigation (complete=%s)",
+                            result.get("count", 0), result.get("complete"))
+            elif result.get("reason") == "no_actionable":
+                logger.info("Alerting: unclaimed disks — complete scan, no disk needs investigation")
             else:
-                logger.warning("Alerting: orphans — check result: %s", result)
+                logger.warning("Alerting: unclaimed disks — check result: %s", result)
         except Exception:
-            logger.exception("Alerting: orphans — unexpected error")
+            logger.exception("Alerting: unclaimed disks — unexpected error")
 
         await asyncio.sleep(interval_sec)

@@ -228,8 +228,35 @@ class TestSession:
 
     def test_missing_id_token_is_refused(self, client, monkeypatch):
         response, _ = sign_in(client, monkeypatch, None)
-        assert response.headers["location"] == "/auth/login"
+        assert response.status_code == 400 and "location" not in response.headers
         assert client.get("/api/alerts/status").status_code == 401
+
+
+class TestSignInFailedPage:
+    def test_failed_exchange_shows_page_with_retry_link(self, client, monkeypatch):
+        monkeypatch.setattr(auth, "oauth", SimpleNamespace(dex=FakeDex(error=Exception("issuer mismatch"))))
+        response = client.get("/auth/callback")
+        assert response.status_code == 400
+        assert "location" not in response.headers  # no redirect loop back to the login
+        assert "Sign-in failed" in response.text
+        assert 'href="/auth/login?next=%2F"' in response.text
+        assert "issuer mismatch" not in response.text
+        assert response.headers["content-security-policy"] == auth._FORBIDDEN_CSP
+
+    def test_retry_link_keeps_next_and_is_escaped(self, client, monkeypatch):
+        class Login:
+            async def authorize_redirect(self, request, redirect_uri):
+                from starlette.responses import RedirectResponse
+                return RedirectResponse("https://issuer.test/auth")
+
+            async def authorize_access_token(self, request, **kwargs):
+                raise Exception("bad state")
+
+        monkeypatch.setattr(auth, "oauth", SimpleNamespace(dex=Login()))
+        client.get("/auth/login", params={"next": '/x?a="<b>&c=1'})
+        response = client.get("/auth/callback")
+        assert "<b>" not in response.text and '"<' not in response.text
+        assert "/auth/login?next=%2Fx%3Fa%3D%22%3Cb%3E%26c%3D1" in response.text
 
 
 # ── 403 page and log lines ───────────────────────────────────────────────────

@@ -1,10 +1,13 @@
+import json
 import logging
+import os
+from typing import NamedTuple
 
 from kubernetes import client, config
 from kubernetes.client import ApiClient, Configuration
 from kubernetes.client.rest import ApiException
 
-from settings import Unavailable, env_bool, env_str
+from settings import ConfigError, Unavailable, env_bool, env_str
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +18,97 @@ K8S_TOKEN       = env_str("K8S_TOKEN")
 K8S_VERIFY_SSL  = env_bool("K8S_VERIFY_SSL", True)
 K8S_CA_FILE     = env_str("K8S_CA_FILE")  # CA bundle for K8S_SERVER
 VSPHERE_DRIVER  = "csi.vsphere.vmware.com"
+
+
+class Cluster(NamedTuple):
+    name: str
+    source: str                       # "env", "in_cluster" or "kubeconfig"
+    kubeconfig: str | None = None
+    context: str | None = None
+    csi_cluster_id: str | None = None  # cluster-id from this cluster's vSphere CSI configuration
+
+
+_CLUSTER_KEYS = {"name", "in_cluster", "kubeconfig", "context", "csi_cluster_id"}
+
+
+def _optional_str(entry: dict, key: str, where: str) -> str | None:
+    value = entry.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError(f"K8S_CLUSTERS: {where}: {key} must be a string")
+    return value.strip() or None
+
+
+def load_clusters() -> list[Cluster]:
+    """The configured clusters; raises ConfigError with a clear message.
+
+    K8S_CLUSTERS is a JSON list, for example
+      [{"name": "local", "in_cluster": true, "csi_cluster_id": "cluster-a"},
+       {"name": "b", "kubeconfig": "/etc/pvc-monitor/kubeconfigs/b", "context": "b", "csi_cluster_id": "cluster-b"}]
+    Without it the single cluster from K8S_SERVER/K8S_TOKEN, KUBECONFIG_PATH or the
+    in-cluster service account is used, named K8S_CLUSTER_NAME (default "default").
+    """
+    raw = env_str("K8S_CLUSTERS")
+    if not raw:
+        return [Cluster(
+            name=env_str("K8S_CLUSTER_NAME") or "default",
+            source="env",
+            csi_cluster_id=env_str("K8S_CSI_CLUSTER_ID") or None,
+        )]
+    if KUBECONFIG_PATH or K8S_SERVER or K8S_TOKEN or env_str("K8S_CLUSTER_NAME") or env_str("K8S_CSI_CLUSTER_ID"):
+        raise ConfigError(
+            "K8S_CLUSTERS cannot be combined with KUBECONFIG_PATH, K8S_SERVER, K8S_TOKEN, "
+            "K8S_CLUSTER_NAME or K8S_CSI_CLUSTER_ID; describe every cluster in K8S_CLUSTERS"
+        )
+    try:
+        entries = json.loads(raw)
+    except ValueError as exc:
+        raise ConfigError(f"K8S_CLUSTERS is not valid JSON: {exc.msg} at position {exc.pos}") from None
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError("K8S_CLUSTERS must be a non-empty JSON list of objects")
+
+    clusters: list[Cluster] = []
+    for i, entry in enumerate(entries):
+        where = f"entry {i + 1}"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"K8S_CLUSTERS: {where} must be an object")
+        unknown = set(entry) - _CLUSTER_KEYS
+        if unknown:
+            raise ConfigError(f"K8S_CLUSTERS: {where}: unknown key(s) {', '.join(sorted(unknown))}")
+        name = _optional_str(entry, "name", where)
+        if not name:
+            raise ConfigError(f"K8S_CLUSTERS: {where}: name is required")
+        where = f"cluster {name!r}"
+        in_cluster = entry.get("in_cluster", False)
+        if not isinstance(in_cluster, bool):
+            raise ConfigError(f"K8S_CLUSTERS: {where}: in_cluster must be true or false")
+        kubeconfig = _optional_str(entry, "kubeconfig", where)
+        context = _optional_str(entry, "context", where)
+        if in_cluster == bool(kubeconfig):
+            raise ConfigError(f"K8S_CLUSTERS: {where}: set exactly one of in_cluster: true or kubeconfig")
+        if in_cluster and context:
+            raise ConfigError(f"K8S_CLUSTERS: {where}: context needs kubeconfig")
+        if kubeconfig and not os.path.isfile(kubeconfig):
+            raise ConfigError(f"K8S_CLUSTERS: {where}: kubeconfig file {kubeconfig} does not exist")
+        clusters.append(Cluster(
+            name=name,
+            source="in_cluster" if in_cluster else "kubeconfig",
+            kubeconfig=kubeconfig,
+            context=context,
+            csi_cluster_id=_optional_str(entry, "csi_cluster_id", where),
+        ))
+
+    names = [c.name for c in clusters]
+    if len(set(names)) != len(names):
+        raise ConfigError("K8S_CLUSTERS: cluster names must be unique")
+    ids = [c.csi_cluster_id for c in clusters if c.csi_cluster_id]
+    if len(set(ids)) != len(ids):
+        raise ConfigError("K8S_CLUSTERS: csi_cluster_id values must be unique")
+    return clusters
+
+
+CLUSTERS = load_clusters()
 SNAPSHOT_GROUP  = "snapshot.storage.k8s.io"
 SNAPSHOT_VER    = "v1"
 
@@ -30,11 +124,12 @@ if K8S_SERVER and K8S_TOKEN and not K8S_VERIFY_SSL:
     )
 
 
-def _get_api_client() -> ApiClient:
+def _get_api_client(cluster: Cluster | None = None) -> ApiClient:
     """
-    Build an ApiClient with credentials explicitly bound.
+    Build an ApiClient for one configured cluster (default: the first).
 
-    Priority:
+    A cluster from K8S_CLUSTERS uses its kubeconfig (and context) or the
+    in-cluster service account. The single-cluster form ("env") uses, by priority:
       1. K8S_SERVER + K8S_TOKEN  — direct bearer token; most reliable for OIDC clusters
          where kubeconfig exec/OIDC plugins are unavailable server-side.
       2. KUBECONFIG_PATH         — load a specific kubeconfig file (supports OIDC via
@@ -42,6 +137,18 @@ def _get_api_client() -> ApiClient:
       3. In-cluster config       — service account mounted inside a pod.
       4. ~/.kube/config          — default kubeconfig as last resort.
     """
+    cluster = cluster or CLUSTERS[0]
+    if cluster.source != "env":
+        try:
+            if cluster.source == "in_cluster":
+                cfg = Configuration()
+                config.load_incluster_config(client_configuration=cfg)
+                return ApiClient(configuration=cfg)
+            return config.new_client_from_config(config_file=cluster.kubeconfig, context=cluster.context)
+        except config.ConfigException as exc:
+            logger.warning("Kubernetes: cluster %r has no usable configuration: %r", cluster.name, str(exc))
+            raise Unavailable(f"Kubernetes cluster {cluster.name!r} is not configured") from exc
+
     # Option 1: explicit server + bearer token (best for OIDC in a backend context)
     if K8S_SERVER and K8S_TOKEN:
         cfg = Configuration()
@@ -101,6 +208,7 @@ def _list_custom(custom: client.CustomObjectsApi, plural: str):
 
 
 def check_k8s_connectivity() -> dict:
+    """Connectivity of the first configured cluster."""
     try:
         with _get_api_client() as api:
             ver = client.VersionApi(api).get_code(_request_timeout=REQUEST_TIMEOUT)
@@ -116,11 +224,11 @@ def check_k8s_connectivity() -> dict:
         return {"connected": False, "configured": True, "error": "connection failed, see the server log"}
 
 
-def get_k8s_persistent_volumes() -> list[dict]:
-    """All PVs. Raises if the list cannot be read completely: the result
-    decides which vSphere disks count as claimed."""
+def get_k8s_persistent_volumes(cluster: Cluster | None = None) -> list[dict]:
+    """All PVs of one cluster. Raises if the list cannot be read completely:
+    the result decides which vSphere disks count as claimed."""
     result = []
-    with _get_api_client() as api:
+    with _get_api_client(cluster) as api:
         for pv in _list_typed(client.CoreV1Api(api).list_persistent_volume):
             if pv.spec.csi:
                 driver       = pv.spec.csi.driver
@@ -154,6 +262,34 @@ def get_k8s_persistent_volumes() -> list[dict]:
     return result
 
 
+def read_cluster(cluster: Cluster, fn):
+    """Return fn(cluster). Any failure becomes an Unavailable that names the
+    cluster (fixed text for clients; the detail goes to the log)."""
+    try:
+        return fn(cluster)
+    except Unavailable as exc:
+        raise Unavailable(f"Kubernetes cluster {cluster.name!r}: {exc}. No result is produced.") from exc
+    except Exception:
+        logger.exception("Kubernetes: reading cluster %r failed", cluster.name)
+        raise Unavailable(
+            f"Kubernetes cluster {cluster.name!r} could not be read completely. "
+            "No result is produced; see the server log."
+        ) from None
+
+
+def get_pvs_of_all_clusters() -> list[dict]:
+    """Every PV of every configured cluster, each tagged with its cluster name.
+
+    Fails closed: if the list of any cluster cannot be read completely, raise
+    an Unavailable naming that cluster instead of returning the others.
+    """
+    result = []
+    for cluster in CLUSTERS:
+        pvs = read_cluster(cluster, get_k8s_persistent_volumes)
+        result.extend({**pv, "cluster": cluster.name} for pv in pvs)
+    return result
+
+
 def _pv_plugin_name(pv) -> str:
     """Best-effort plugin name for non-CSI, non-vSphere PVs."""
     spec = pv.spec
@@ -168,9 +304,9 @@ def _pv_plugin_name(pv) -> str:
     return "unknown"
 
 
-def get_k8s_persistent_volume_claims() -> list[dict]:
+def get_k8s_persistent_volume_claims(cluster: Cluster | None = None) -> list[dict]:
     result = []
-    with _get_api_client() as api:
+    with _get_api_client(cluster) as api:
         v1 = client.CoreV1Api(api)
         for pvc in _list_typed(v1.list_persistent_volume_claim_for_all_namespaces):
             requested = (pvc.spec.resources.requests or {}).get("storage", "N/A") if pvc.spec.resources else "N/A"

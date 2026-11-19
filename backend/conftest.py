@@ -10,7 +10,7 @@ dotenv.load_dotenv = lambda *args, **kwargs: False
 
 _PREFIXES = (
     "VCENTER_", "K8S_", "KUBECONFIG", "SMTP_", "ALERT_", "OIDC_", "SESSION_",
-    "AUTH_", "ALLOWED_GROUPS", "TRUSTED_HOSTS", "ENABLE_DEBUG",
+    "AUTH_", "ALLOWED_GROUPS", "TRUSTED_HOSTS", "ENABLE_DEBUG", "UNCLAIMED_",
 )
 for _name in list(os.environ):
     if _name.startswith(_PREFIXES):

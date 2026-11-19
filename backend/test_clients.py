@@ -190,7 +190,7 @@ def fake_core(monkeypatch):
         def __exit__(self, *exc):
             return False
 
-    monkeypatch.setattr(k8s_client, "_get_api_client", lambda: FakeApi())
+    monkeypatch.setattr(k8s_client, "_get_api_client", lambda cluster=None: FakeApi())
 
     def install(pages):
         core = FakeCoreV1(pages)
@@ -315,47 +315,3 @@ def test_real_client_version_check(k8s_http):
 def json_fill(template, n):
     import json
     return json.loads(json.dumps(template).replace("{n}", n))
-
-
-# ── Orphan scan end to end with a fake vCenter ───────────────────────────────
-
-def test_orphan_scan_with_fake_vcenter(monkeypatch):
-    def fcd(fcd_id):
-        cfg = SimpleNamespace(id=SimpleNamespace(id=fcd_id), name=f"disk-{fcd_id}", capacityInMB=1024,
-                              backing=SimpleNamespace(filePath=f"[ds1] fcd/{fcd_id}.vmdk"))
-        return SimpleNamespace(config=cfg)
-
-    fcds = {"claimed-1": fcd("claimed-1"), "orphan-1": fcd("orphan-1")}
-    destroyed, logouts = [], []
-    datastore = SimpleNamespace(name="ds1")
-
-    def view_for(types):
-        items = [datastore] if types == [vcenter_client.vim.Datastore] else []
-        return SimpleNamespace(view=items, Destroy=lambda: destroyed.append(types[0]))
-
-    content = SimpleNamespace(
-        rootFolder=object(),
-        viewManager=SimpleNamespace(CreateContainerView=lambda root, types, rec: view_for(types)),
-        vStorageObjectManager=SimpleNamespace(
-            ListVStorageObject=lambda ds: list(fcds),
-            RetrieveVStorageObject=lambda ref, ds: fcds[ref],
-        ),
-    )
-    monkeypatch.setattr(vcenter_client, "VCENTER_HOST", "vc.test")
-    monkeypatch.setattr(vcenter_client, "SmartConnect", lambda **kw: SimpleNamespace(RetrieveContent=lambda: content))
-    monkeypatch.setattr(vcenter_client, "Disconnect", logouts.append)
-    monkeypatch.setattr(k8s_client, "get_k8s_persistent_volumes", lambda: [
-        {"name": "pv", "driver": "csi.vsphere.vmware.com", "volume_handle": "CLAIMED-1"},
-    ])
-
-    orphans = vcenter_client.get_orphaned_fcds()
-    assert [o["fcd_id"] for o in orphans] == ["orphan-1"]
-    assert len(logouts) == 1 and len(destroyed) == 2  # VM view and datastore view
-
-    def failing_list():
-        raise ApiException(status=410, reason="Expired")
-
-    vcenter_client._scan_cache.clear()
-    monkeypatch.setattr(k8s_client, "get_k8s_persistent_volumes", failing_list)
-    with pytest.raises(ApiException):
-        vcenter_client.get_orphaned_fcds()

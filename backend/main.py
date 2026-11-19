@@ -159,28 +159,37 @@ def _register_routes(app: FastAPI) -> None:
     def volume_overview():
         container_vols = _call(vcenter_client.get_container_volumes)
 
+        # A vSphere failure is reported with the Kubernetes data, never shown as "idle".
+        vsphere_error = None
+        scan = {"volumes": [], "complete": False, "problems": []}
         try:
-            persistent_vols = vcenter_client.get_persistent_volumes()
+            scan = vcenter_client.get_persistent_volumes()
+        except Unavailable as exc:
+            vsphere_error = str(exc)
         except Exception:
             logger.exception("overview: vSphere scan failed, showing Kubernetes data only")
-            persistent_vols = []
+            vsphere_error = "The vSphere scan failed, see the server log"
 
-        vsphere_by_pv = {v["pv_name"].lower(): v for v in persistent_vols}
+        # Joined by cluster and volume handle (the FCD UUID), never by name.
+        vsphere_by_handle = {(v["cluster"], v["volume_id"].lower()): v for v in scan["volumes"]}
 
         result = []
         for pvc in container_vols:
-            pv_name    = (pvc.get("pv_name") or "").lower()
-            vsphere    = vsphere_by_pv.get(pv_name)
+            handle     = (pvc.get("volume_handle") or "").lower()
+            vsphere    = vsphere_by_handle.get((pvc.get("cluster"), handle))
             pvc_status = pvc.get("status") or ""
 
             if pvc_status not in ("Bound",):
                 usage_state = pvc_status.lower() if pvc_status else "unknown"
-            elif vsphere and (vsphere.get("vm_name") or "—") not in ("—", ""):
+            elif vsphere and vsphere["attached"] == "yes":
                 usage_state = "active"
-            else:
+            elif vsphere and vsphere["attached"] == "no":
                 usage_state = "idle"
+            else:  # no vSphere data, disk not found, or VM scan incomplete
+                usage_state = "unknown"
 
             result.append({
+                "cluster":        pvc.get("cluster"),
                 "namespace":      pvc["namespace"],
                 "pvc_name":       pvc["name"],
                 "pv_name":        pvc.get("pv_name") or "—",
@@ -197,7 +206,12 @@ def _register_routes(app: FastAPI) -> None:
                 "usage_state":    usage_state,
             })
 
-        return result
+        return {
+            "volumes": result,
+            "vsphere_error": vsphere_error,
+            "vsphere_complete": vsphere_error is None and scan["complete"],
+            "vsphere_problems": scan["problems"],
+        }
 
     # Alerts
     @app.get("/api/alerts/status")
