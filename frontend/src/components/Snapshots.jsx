@@ -265,6 +265,7 @@ export default function Snapshots({ onCount }) {
                 <table>
                   <thead>
                     <tr>
+                      <th>Cluster</th>
                       <th>PVC Name</th>
                       <th>PV Name</th>
                       <th>Snapshot ID</th>
@@ -287,6 +288,7 @@ export default function Snapshots({ onCount }) {
                               : undefined,
                         }}
                       >
+                        <td>{snap.cluster}</td>
                         <td style={{ fontWeight: 500 }}>{snap.pvc_name}</td>
                         <td className="td-mono" style={{ fontSize: 11 }}>{snap.pv_name}</td>
                         <td className="td-mono" style={{ fontSize: 11 }}>{snap.snapshot_id}</td>

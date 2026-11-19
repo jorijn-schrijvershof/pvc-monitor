@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import ScanWarning from './ScanWarning'
 
 function powerBadge(state) {
   if (state === 'poweredOn')  return <span className="badge badge-green">On</span>
@@ -18,6 +19,7 @@ export default function PersistentVolumes({ onCount }) {
   onCountRef.current = onCount
 
   const [data, setData]         = useState([])
+  const [scan, setScan]         = useState(null)
   const [loading, setLoading]   = useState(true)
   const [error, setError]       = useState(null)
   const [search, setSearch]     = useState('')
@@ -33,8 +35,9 @@ export default function PersistentVolumes({ onCount }) {
         throw new Error(err.detail || res.statusText)
       }
       const json = await res.json()
-      setData(json)
-      onCountRef.current(json.length)
+      setScan(json)
+      setData(json.volumes)
+      onCountRef.current(json.volumes.length)
     } catch (e) {
       setError(e.message)
     } finally {
@@ -47,6 +50,7 @@ export default function PersistentVolumes({ onCount }) {
 
   const filtered = data.filter(v =>
     !search ||
+    (v.cluster      || '').toLowerCase().includes(search.toLowerCase()) ||
     (v.pv_name      || '').toLowerCase().includes(search.toLowerCase()) ||
     (v.claim        || '').toLowerCase().includes(search.toLowerCase()) ||
     (v.vm_name      || '').toLowerCase().includes(search.toLowerCase()) ||
@@ -62,7 +66,7 @@ export default function PersistentVolumes({ onCount }) {
         <div>
           <div className="section-title">Persistent Volumes</div>
           <div className="section-subtitle">
-            vSphere VMDKs matched to Kubernetes PVs via PV name — only visible while a pod has the volume attached
+            vSphere First Class Disks matched to the PVs of every configured cluster by volume handle (disk UUID)
           </div>
         </div>
         <button className="btn" onClick={fetchData} disabled={spinning}>
@@ -70,11 +74,19 @@ export default function PersistentVolumes({ onCount }) {
         </button>
       </div>
 
+      {!loading && !error && scan && !scan.complete && (
+        <ScanWarning
+          title="Incomplete vSphere scan"
+          text="Some disks or attachments could not be read, so volumes may be missing or show no VM."
+          problems={scan.problems}
+        />
+      )}
+
       {!loading && !error && (
         <div className="stats-bar">
           <div className="stat-card">
             <div className="stat-value">{data.length}</div>
-            <div className="stat-label">Attached Volumes</div>
+            <div className="stat-label">Volumes</div>
           </div>
           <div className="stat-card">
             <div className="stat-value">{totalCapacity.toFixed(1)} GB</div>
@@ -85,7 +97,7 @@ export default function PersistentVolumes({ onCount }) {
             <div className="stat-label">On Powered-On VMs</div>
           </div>
           <div className="stat-card">
-            <div className="stat-value">{new Set(data.map(v => v.vm_name)).size}</div>
+            <div className="stat-value">{new Set(data.filter(v => v.attached === 'yes').map(v => v.vm_name)).size}</div>
             <div className="stat-label">Node VMs</div>
           </div>
         </div>
@@ -109,7 +121,7 @@ export default function PersistentVolumes({ onCount }) {
             <input
               type="search"
               className="search-input"
-              placeholder="Filter by PV name, claim, VM, datastore, or storage class…"
+              placeholder="Filter by cluster, PV name, claim, VM, datastore, or storage class…"
               value={search}
               onChange={e => setSearch(e.target.value)}
             />
@@ -124,18 +136,14 @@ export default function PersistentVolumes({ onCount }) {
                   <div>
                     {search
                       ? 'No matching volumes'
-                      : 'No vSphere CSI volumes found attached to any node VM'}
+                      : 'No First Class Disk matches a vSphere CSI PV of a configured cluster'}
                   </div>
-                  {!search && (
-                    <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 8, maxWidth: 420, textAlign: 'center' }}>
-                      Volumes only appear here while a pod has them mounted. If all pods are stopped the VMDKs will be detached from the node VMs.
-                    </div>
-                  )}
                 </div>
               ) : (
                 <table>
                   <thead>
                     <tr>
+                      <th>Cluster</th>
                       <th>PV Name</th>
                       <th>PVC Claim</th>
                       <th>K8s Status</th>
@@ -150,6 +158,7 @@ export default function PersistentVolumes({ onCount }) {
                   <tbody>
                     {filtered.map((vol, i) => (
                       <tr key={i}>
+                        <td>{vol.cluster}</td>
                         <td className="td-mono" style={{ fontWeight: 500 }}>{vol.pv_name || '—'}</td>
                         <td className="td-mono">{vol.claim || '—'}</td>
                         <td>{k8sBadge(vol.k8s_status)}</td>
@@ -157,8 +166,10 @@ export default function PersistentVolumes({ onCount }) {
                         <td>{vol.storage_class || '—'}</td>
                         <td>{vol.datastore}</td>
                         <td className="td-mono" style={{ fontSize: 11 }}>{vol.file_path}</td>
-                        <td style={{ fontWeight: 500 }}>{vol.vm_name}</td>
-                        <td>{powerBadge(vol.vm_power_state)}</td>
+                        <td style={{ fontWeight: 500 }}>
+                          {vol.attached === 'unknown' ? <span className="badge badge-gray">unknown</span> : vol.vm_name}
+                        </td>
+                        <td>{vol.attached === 'yes' ? powerBadge(vol.vm_power_state) : '—'}</td>
                       </tr>
                     ))}
                   </tbody>

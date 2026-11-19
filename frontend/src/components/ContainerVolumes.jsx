@@ -50,6 +50,7 @@ export default function ContainerVolumes({ onCount }) {
 
   const filtered = data.filter(v =>
     !search ||
+    (v.cluster        || '').toLowerCase().includes(search.toLowerCase()) ||
     (v.name           || '').toLowerCase().includes(search.toLowerCase()) ||
     (v.namespace      || '').toLowerCase().includes(search.toLowerCase()) ||
     (v.pv_name        || '').toLowerCase().includes(search.toLowerCase()) ||
@@ -144,6 +145,7 @@ export default function ContainerVolumes({ onCount }) {
                 <table>
                   <thead>
                     <tr>
+                      <th>Cluster</th>
                       <th>Namespace</th>
                       <th>PVC Name</th>
                       <th>Status</th>
@@ -158,6 +160,7 @@ export default function ContainerVolumes({ onCount }) {
                   <tbody>
                     {filtered.map((vol, i) => (
                       <tr key={i}>
+                        <td>{vol.cluster}</td>
                         <td><span className="badge badge-blue">{vol.namespace}</span></td>
                         <td style={{ fontWeight: 500 }}>{vol.name}</td>
                         <td>{phaseBadge(vol.status)}</td>

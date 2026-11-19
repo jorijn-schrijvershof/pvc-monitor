@@ -1,13 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import ScanWarning from './ScanWarning'
 
 const STATE_META = {
   active:   { label: 'Active',   className: 'badge-green',  desc: 'Bound and mounted on a node VM' },
   idle:     { label: 'Idle',     className: 'badge-yellow', desc: 'Bound but no pod is using it' },
-  released: { label: 'Released', className: 'badge-red',    desc: 'PVC released — safe to delete' },
+  released: { label: 'Released', className: 'badge-red',    desc: 'Claim deleted, PV kept — needs investigation' },
   lost:     { label: 'Lost',     className: 'badge-red',    desc: 'PVC lost — backing storage gone' },
   failed:   { label: 'Failed',   className: 'badge-red',    desc: 'PVC failed to provision' },
   pending:  { label: 'Pending',  className: 'badge-blue',   desc: 'Waiting for storage to be provisioned' },
-  unknown:  { label: 'Unknown',  className: 'badge-gray',   desc: '' },
+  unknown:  { label: 'Unknown',  className: 'badge-gray',   desc: 'vSphere state could not be determined' },
 }
 
 function usageBadge(state) {
@@ -36,6 +37,7 @@ export default function Overview({ onCount }) {
   onCountRef.current = onCount
 
   const [data, setData]           = useState([])
+  const [vsphere, setVsphere]     = useState(null)
   const [loading, setLoading]     = useState(true)
   const [error, setError]         = useState(null)
   const [notConfigured, setNotConfigured] = useState(false)
@@ -52,7 +54,7 @@ export default function Overview({ onCount }) {
       if (res.status === 503) {
         const err = await res.json()
         setNotConfigured(true)
-        setError(err.detail || 'Kubernetes not configured')
+        setError(err.detail || 'Kubernetes unavailable')
         onCountRef.current(0)
         return
       }
@@ -61,8 +63,9 @@ export default function Overview({ onCount }) {
         throw new Error(err.detail || res.statusText)
       }
       const json = await res.json()
-      setData(json)
-      onCountRef.current(json.filter(v => UNUSED_STATES.has(v.usage_state)).length)
+      setData(json.volumes)
+      setVsphere(json)
+      onCountRef.current(json.volumes.filter(v => UNUSED_STATES.has(v.usage_state)).length)
     } catch (e) {
       setError(e.message)
     } finally {
@@ -82,6 +85,7 @@ export default function Overview({ onCount }) {
 
   const filtered = afterFilter.filter(v =>
     !search ||
+    (v.cluster       || '').toLowerCase().includes(search.toLowerCase()) ||
     (v.pvc_name      || '').toLowerCase().includes(search.toLowerCase()) ||
     (v.namespace     || '').toLowerCase().includes(search.toLowerCase()) ||
     (v.pv_name       || '').toLowerCase().includes(search.toLowerCase()) ||
@@ -99,7 +103,7 @@ export default function Overview({ onCount }) {
         <div>
           <div className="section-title">Volume Overview</div>
           <div className="section-subtitle">
-            All vSphere CSI PVCs with their vCenter FCD status — spot unused volumes at a glance
+            vSphere CSI PVCs of every configured cluster with the state of their disk in vCenter
           </div>
         </div>
         <button className="btn" onClick={fetchData} disabled={spinning}>
@@ -111,7 +115,7 @@ export default function Overview({ onCount }) {
         <div className="info-banner">
           <span style={{ fontSize: 16 }}>ℹ</span>
           <div>
-            <strong>Kubernetes not configured</strong> — cannot load PVC list.
+            <strong>Kubernetes unavailable</strong> — cannot load the PVC list.
             <br />
             <span style={{ color: 'var(--text-secondary)' }}>{error}</span>
           </div>
@@ -120,6 +124,21 @@ export default function Overview({ onCount }) {
 
       {!notConfigured && error && (
         <div className="error-state"><span>⚠</span><span>{error}</span></div>
+      )}
+
+      {!loading && !notConfigured && !error && vsphere?.vsphere_error && (
+        <ScanWarning
+          title="vSphere data unavailable"
+          text={`${vsphere.vsphere_error}. Volume states are shown as Unknown.`}
+        />
+      )}
+
+      {!loading && !notConfigured && !error && vsphere && !vsphere.vsphere_error && !vsphere.vsphere_complete && (
+        <ScanWarning
+          title="Incomplete vSphere scan"
+          text="Volumes whose disk or attachment could not be read are shown as Unknown."
+          problems={vsphere.vsphere_problems}
+        />
       )}
 
       {!loading && !notConfigured && !error && (
@@ -193,7 +212,7 @@ export default function Overview({ onCount }) {
               type="search"
               className="search-input"
               style={{ flex: 1, minWidth: 200 }}
-              placeholder="Filter by PVC, namespace, PV, VM, or storage class…"
+              placeholder="Filter by cluster, PVC, namespace, PV, VM, or storage class…"
               value={search}
               onChange={e => setSearch(e.target.value)}
             />
@@ -216,6 +235,7 @@ export default function Overview({ onCount }) {
                   <thead>
                     <tr>
                       <th>State</th>
+                      <th>Cluster</th>
                       <th>Namespace</th>
                       <th>PVC Name</th>
                       <th>Capacity</th>
@@ -240,6 +260,7 @@ export default function Overview({ onCount }) {
                         }}
                       >
                         <td>{usageBadge(vol.usage_state)}</td>
+                        <td>{vol.cluster}</td>
                         <td><span className="badge badge-blue">{vol.namespace}</span></td>
                         <td style={{ fontWeight: 500 }}>{vol.pvc_name}</td>
                         <td><strong>{vol.capacity}</strong></td>
@@ -263,7 +284,7 @@ export default function Overview({ onCount }) {
 
           {/* Legend */}
           <div style={{ display: 'flex', gap: 20, marginTop: 12, flexWrap: 'wrap' }}>
-            {Object.entries(STATE_META).filter(([k]) => k !== 'unknown').map(([k, m]) => (
+            {Object.entries(STATE_META).map(([k, m]) => (
               <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
                 <span className={`badge ${m.className}`} style={{ fontSize: 11 }}>{m.label}</span>
                 {m.desc}

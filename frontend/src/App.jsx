@@ -43,7 +43,7 @@ const TABS = [
   { id: 'persistent-volumes', label: 'Persistent Volumes', group: 'vsphere' },
   { id: 'container-volumes',  label: 'Container Volumes',  group: 'vsphere' },
   { id: 'snapshots',          label: 'Snapshots',          group: 'vsphere' },
-  { id: 'orphaned-fcds',      label: 'Orphaned FCDs',      group: 'vsphere' },
+  { id: 'orphaned-fcds',      label: 'Unclaimed Disks',    group: 'vsphere' },
   { id: 'k8s-volumes',        label: 'K8s Volumes',        group: 'k8s'     },
   { id: 'k8s-snapshots',      label: 'K8s Snapshots',      group: 'k8s'     },
 ]
@@ -100,7 +100,7 @@ export default function App() {
         {TABS.map((tab, i) => {
           const prevGroup = i > 0 ? TABS[i - 1].group : tab.group
           const count = counts[tab.id]
-          // Overview and orphaned-fcds badges are red when > 0 (needs attention)
+          // Overview and unclaimed-disk badges are red when > 0 (needs investigation)
           const isAlert = (tab.id === 'overview' || tab.id === 'orphaned-fcds') && count > 0
           return (
             <button

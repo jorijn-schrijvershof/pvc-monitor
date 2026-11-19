@@ -1,9 +1,34 @@
 import { useState, useEffect, useCallback } from 'react'
+import ScanWarning from './ScanWarning'
 
-const FILTER_OPTS = [
-  { val: 'all',         label: 'All'         },
-  { val: 'vm-attached', label: 'VM Attached' },
-  { val: 'unattached',  label: 'Unattached'  },
+// What each category means for an operator. Nothing here means "safe to delete".
+const CATEGORIES = {
+  candidate: {
+    label: 'Candidate', className: 'badge-red',
+    desc: 'Not claimed by any configured cluster and not known to CNS. Needs investigation.',
+  },
+  orphan_known_to_cns: {
+    label: 'Known to CNS', className: 'badge-yellow',
+    desc: 'Not claimed, but CNS records it for a configured cluster. Needs investigation.',
+  },
+  foreign: {
+    label: 'Other cluster', className: 'badge-blue',
+    desc: 'CNS records a cluster that is not configured here; probably another cluster\'s disk.',
+  },
+  inconsistent: {
+    label: 'Inconsistent', className: 'badge-yellow',
+    desc: 'Claimed by a configured cluster, but CNS disagrees. Report only.',
+  },
+  unknown: {
+    label: 'Unknown', className: 'badge-gray',
+    desc: 'Cannot be decided: CNS state unknown or the CNS cluster-id cannot be placed.',
+  },
+}
+
+const FILTERS = [
+  { val: 'actionable', label: 'Needs investigation' },
+  { val: 'all',        label: 'All' },
+  ...Object.entries(CATEGORIES).map(([val, c]) => ({ val, label: c.label })),
 ]
 
 function formatDate(iso) {
@@ -12,6 +37,12 @@ function formatDate(iso) {
     year: 'numeric', month: 'short', day: 'numeric',
     hour: '2-digit', minute: '2-digit',
   })
+}
+
+function formatAge(hours) {
+  if (hours == null) return 'unknown'
+  if (hours < 48) return `${Math.round(hours)} h`
+  return `${Math.round(hours / 24)} d`
 }
 
 function AlertPanel({ status, testResult }) {
@@ -32,7 +63,7 @@ function AlertPanel({ status, testResult }) {
       flexWrap: 'wrap',
     }}>
       <span style={{ fontSize: 15 }}>{configured ? '🔔' : '🔕'}</span>
-      <strong style={{ fontSize: 13, whiteSpace: 'nowrap' }}>Orphan Alerts</strong>
+      <strong style={{ fontSize: 13, whiteSpace: 'nowrap' }}>Unclaimed Disk Alerts</strong>
       <span className={`badge ${configured ? 'badge-green' : 'badge-gray'}`} style={{ fontSize: 11 }}>
         {configured ? 'Configured' : 'Not configured'}
       </span>
@@ -40,20 +71,20 @@ function AlertPanel({ status, testResult }) {
       <div style={{ flex: 1, fontSize: 12, color: 'var(--text-secondary)' }}>
         {configured ? (
           <>
-            <span>Every <strong style={{ color: 'var(--text)' }}>{check_interval_hours}h</strong></span>
+            <span>Every <strong style={{ color: 'var(--text-primary)' }}>{check_interval_hours}h</strong></span>
             <span style={{ margin: '0 6px' }}>·</span>
-            <span>To: <strong style={{ color: 'var(--text)' }}>{(alert_to || []).join(', ')}</strong></span>
+            <span>To: <strong style={{ color: 'var(--text-primary)' }}>{(alert_to || []).join(', ')}</strong></span>
             {last_check && (
               <>
                 <span style={{ margin: '0 6px' }}>·</span>
                 <span>Last check: {formatDate(last_check)}</span>
+                {last_count != null && <span> ({last_count} need investigation)</span>}
               </>
             )}
             {last_alert && (
               <>
                 <span style={{ margin: '0 6px' }}>·</span>
                 <span>Last alert: {formatDate(last_alert)}</span>
-                {last_count != null && <span> ({last_count} orphaned)</span>}
               </>
             )}
             {last_error && (
@@ -79,13 +110,33 @@ function AlertPanel({ status, testResult }) {
   )
 }
 
+function AttachedCell({ item }) {
+  if (item.attached === 'yes') {
+    return <span className="badge badge-yellow" title={`Power: ${item.vm_power_state}`}>{item.vm_name}</span>
+  }
+  if (item.attached === 'unknown') {
+    return <span className="badge badge-gray" title="The VM scan was incomplete">unknown</span>
+  }
+  return <span style={{ color: 'var(--text-secondary)' }}>no</span>
+}
+
+function CnsCell({ item }) {
+  if (item.cns_known == null) return <span className="badge badge-gray">unknown</span>
+  if (!item.cns_known) return <span style={{ color: 'var(--text-secondary)' }}>not known</span>
+  return (
+    <span className="td-mono" title={item.cns_cluster_id || ''}>
+      {item.cns_cluster || item.cns_cluster_id || 'no cluster-id'}
+    </span>
+  )
+}
+
 export default function OrphanedFCDs({ onCount }) {
-  const [items, setItems]         = useState([])
+  const [scan, setScan]           = useState(null)
   const [loading, setLoading]     = useState(true)
   const [error, setError]         = useState(null)
   const [spinning, setSpinning]   = useState(false)
   const [search, setSearch]       = useState('')
-  const [filter, setFilter]       = useState('all')
+  const [filter, setFilter]       = useState('actionable')
   const [alertStatus, setAlertStatus] = useState(null)
   const [testing, setTesting]     = useState(false)
   const [testResult, setTestResult]   = useState(null)
@@ -100,9 +151,10 @@ export default function OrphanedFCDs({ onCount }) {
         throw new Error(err.detail || res.statusText)
       }
       const json = await res.json()
-      setItems(json)
-      onCount?.(json.length)
+      setScan(json)
+      onCount?.(json.counts.actionable)
     } catch (e) {
+      setScan(null)
       setError(e.message)
     } finally {
       setLoading(false)
@@ -135,10 +187,11 @@ export default function OrphanedFCDs({ onCount }) {
       } else if (data.sent) {
         setTestResult({
           ok: true,
-          msg: `Sent to ${(data.recipients || []).join(', ')} · ${data.count} orphaned FCD${data.count !== 1 ? 's' : ''}`,
+          msg: `Sent to ${(data.recipients || []).join(', ')} · ${data.count} need investigation`
+            + (data.complete === false ? ' · scan incomplete' : ''),
         })
       } else {
-        setTestResult({ ok: false, msg: data.reason || 'Not sent' })
+        setTestResult({ ok: false, msg: data.error || data.reason || 'Not sent' })
       }
     } catch (e) {
       setTestResult({ ok: false, msg: e.message })
@@ -148,34 +201,31 @@ export default function OrphanedFCDs({ onCount }) {
     }
   }
 
-  const totalGB    = items.reduce((s, i) => s + (i.capacity_gb || 0), 0)
-  const vmAttached = items.filter(i => i.vm_name && i.vm_name !== '—').length
+  const items  = scan?.disks || []
+  const counts = scan?.counts || {}
 
-  const afterFilter = items.filter(i => {
-    if (filter === 'vm-attached') return i.vm_name && i.vm_name !== '—'
-    if (filter === 'unattached')  return !i.vm_name || i.vm_name === '—'
-    return true
-  })
-
+  const afterFilter = items.filter(i =>
+    filter === 'all' ? true : filter === 'actionable' ? i.actionable : i.category === filter
+  )
   const q = search.toLowerCase()
   const visible = q
     ? afterFilter.filter(i =>
-        (i.fcd_id    || '').toLowerCase().includes(q) ||
-        (i.fcd_name  || '').toLowerCase().includes(q) ||
-        (i.datastore || '').toLowerCase().includes(q) ||
-        (i.vm_name   || '').toLowerCase().includes(q) ||
-        (i.file_path || '').toLowerCase().includes(q)
+        [i.fcd_id, i.fcd_name, i.datastore, i.vm_name, i.file_path, i.cns_cluster, i.cns_cluster_id, ...(i.claimed_by || [])]
+          .some(v => (v || '').toLowerCase().includes(q))
       )
     : afterFilter
+
+  const actionableGB = items.filter(i => i.actionable).reduce((s, i) => s + (i.capacity_gb || 0), 0)
 
   return (
     <section>
       <div className="section-header">
         <div>
-          <div className="section-title">Orphaned FCDs</div>
+          <div className="section-title">Unclaimed Disks</div>
           <div className="section-subtitle">
-            vSphere First Class Disks with no corresponding Kubernetes PersistentVolume — likely leaked volumes
-            (PV deleted with Retain policy) or pre-existing non-CSI disks.
+            First Class Disks on the scanned datastores that are not claimed by any configured Kubernetes cluster,
+            or that CNS and Kubernetes disagree about. Every entry needs investigation; nothing here establishes
+            that a disk can be removed.
           </div>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
@@ -183,7 +233,7 @@ export default function OrphanedFCDs({ onCount }) {
             className="btn"
             onClick={sendTestAlert}
             disabled={testing}
-            title="Send a test orphan alert email now"
+            title="Send a test unclaimed-disk alert email now"
           >
             {testing ? '…' : '✉ Test Alert'}
           </button>
@@ -195,72 +245,84 @@ export default function OrphanedFCDs({ onCount }) {
 
       <AlertPanel status={alertStatus} testResult={testResult} />
 
-      {!loading && !error && (
-        <div className="stats-bar">
-          <div className="stat-card" style={items.length > 0 ? { borderColor: 'rgba(248,81,73,.5)' } : undefined}>
-            <div className="stat-value" style={items.length > 0 ? { color: 'var(--danger)' } : undefined}>
-              {items.length}
-            </div>
-            <div className="stat-label">Orphaned FCDs</div>
-          </div>
-          <div className="stat-card" style={totalGB > 0 ? { borderColor: 'rgba(210,153,34,.5)' } : undefined}>
-            <div className="stat-value" style={totalGB > 0 ? { color: 'var(--warning)' } : undefined}>
-              {totalGB.toFixed(1)} GB
-            </div>
-            <div className="stat-label">Wasted capacity</div>
-          </div>
-          <div
-            className="stat-card"
-            style={vmAttached > 0 ? { borderColor: 'rgba(210,153,34,.5)' } : undefined}
-            title="VM-attached FCDs may still be in use outside of Kubernetes"
-          >
-            <div className="stat-value" style={vmAttached > 0 ? { color: 'var(--warning)' } : undefined}>
-              {vmAttached}
-            </div>
-            <div className="stat-label">VM attached</div>
-          </div>
-        </div>
-      )}
-
       {loading && (
         <div className="loading-state">
           <div className="spinner" />
-          Loading orphaned FCDs…
+          Scanning datastores…
         </div>
       )}
 
       {error && (
         <div className="error-state">
           <span>⚠</span>
-          <span>{error}</span>
+          <span>No result: {error}</span>
         </div>
       )}
 
-      {!loading && !error && (
+      {scan && (
         <>
-          {/* Filter pills */}
+          {!scan.complete && (
+            <ScanWarning
+              title="Incomplete scan"
+              text="Parts of vCenter could not be read. Disks may be missing from this list, and a disk that is not listed may still be unclaimed."
+              problems={scan.problems}
+            />
+          )}
+          {scan.cns !== 'ok' && (
+            <ScanWarning
+              title={scan.cns === 'disabled' ? 'CNS query disabled' : 'CNS state unknown'}
+              text="Without Cloud Native Storage data no disk can be placed in a category, so every unclaimed disk is Unknown and none is listed as needing investigation."
+            />
+          )}
+
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 12 }}>
+            Clusters consulted:{' '}
+            {scan.clusters.map((c, i) => (
+              <span key={c.name}>
+                {i > 0 && ', '}
+                <strong style={{ color: 'var(--text-primary)' }}>{c.name}</strong>
+                {c.csi_cluster_id ? <span className="td-mono"> ({c.csi_cluster_id})</span> : ' (no csi_cluster_id)'}
+              </span>
+            ))}
+            <span style={{ margin: '0 6px' }}>·</span>
+            Scanned {formatDate(scan.scanned_at)}
+            <span style={{ margin: '0 6px' }}>·</span>
+            Minimum age {scan.min_age_hours} h
+          </div>
+
+          <div className="stats-bar">
+            <div className="stat-card" style={counts.actionable > 0 ? { borderColor: 'rgba(248,81,73,.5)' } : undefined}>
+              <div className="stat-value" style={counts.actionable > 0 ? { color: 'var(--danger)' } : undefined}>
+                {counts.actionable}
+              </div>
+              <div className="stat-label">Need investigation</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-value">{actionableGB.toFixed(1)} GB</div>
+              <div className="stat-label">Capacity of those disks</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-value">{counts.in_use}</div>
+              <div className="stat-label">Claimed (in use)</div>
+            </div>
+          </div>
+
           <div style={{ display: 'flex', gap: 6, marginBottom: 12, flexWrap: 'wrap' }}>
-            {FILTER_OPTS.map(({ val, label }) => {
-              const count =
-                val === 'all'         ? items.length :
-                val === 'vm-attached' ? vmAttached   :
-                items.length - vmAttached
+            {FILTERS.map(({ val, label }) => {
+              const count = val === 'all' ? items.length : counts[val] ?? 0
               const isActive = filter === val
-              const color =
-                val === 'vm-attached' ? 'var(--warning)' :
-                val === 'unattached'  ? 'var(--success)'  :
-                'var(--text-secondary)'
               return (
                 <button
                   key={val}
                   onClick={() => setFilter(val)}
+                  title={CATEGORIES[val]?.desc}
                   style={{
                     display: 'flex', alignItems: 'center', gap: 6,
                     padding: '4px 12px',
-                    border: `1px solid ${isActive ? color : 'var(--border)'}`,
+                    border: `1px solid ${isActive ? 'var(--accent)' : 'var(--border)'}`,
                     borderRadius: 20,
-                    background: isActive ? `color-mix(in srgb, ${color} 12%, transparent)` : 'transparent',
-                    color: isActive ? color : 'var(--text-secondary)',
+                    background: isActive ? 'color-mix(in srgb, var(--accent) 12%, transparent)' : 'transparent',
+                    color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)',
                     fontSize: 12, fontWeight: isActive ? 600 : 400,
                     cursor: 'pointer', transition: 'all .15s',
                   }}
@@ -281,7 +343,7 @@ export default function OrphanedFCDs({ onCount }) {
             <input
               type="search"
               className="search-input"
-              placeholder="Search FCD ID, name, datastore, VM…"
+              placeholder="Search FCD ID, name, datastore, VM, cluster…"
               value={search}
               onChange={e => setSearch(e.target.value)}
               style={{ width: 340 }}
@@ -293,15 +355,13 @@ export default function OrphanedFCDs({ onCount }) {
             )}
           </div>
 
-          {items.length === 0 ? (
+          {visible.length === 0 ? (
             <div className="empty-state">
-              <div className="empty-state-icon">✓</div>
-              <div>No orphaned FCDs found — all vSphere FCDs are claimed by a Kubernetes PV.</div>
-            </div>
-          ) : visible.length === 0 ? (
-            <div className="empty-state">
-              <div className="empty-state-icon">🔍</div>
-              <div>No FCDs match the current filter.</div>
+              <div>
+                {scan.complete && scan.cns === 'ok'
+                  ? 'No disk in this view.'
+                  : 'No disk in this view, but the scan above is incomplete or CNS is unknown.'}
+              </div>
             </div>
           ) : (
             <div className="table-container">
@@ -309,30 +369,45 @@ export default function OrphanedFCDs({ onCount }) {
                 <table>
                   <thead>
                     <tr>
+                      <th>Category</th>
                       <th>FCD ID</th>
                       <th>Name</th>
                       <th>Datastore</th>
                       <th>Size (GB)</th>
+                      <th>Claimed by</th>
+                      <th>CNS cluster</th>
+                      <th>Attached</th>
+                      <th>Age</th>
                       <th>File Path</th>
-                      <th>VM Attached</th>
-                      <th>Power</th>
                     </tr>
                   </thead>
                   <tbody>
                     {visible.map(item => {
-                      const attached = item.vm_name && item.vm_name !== '—'
+                      const cat = CATEGORIES[item.category] || CATEGORIES.unknown
                       return (
-                        <tr
-                          key={item.fcd_id}
-                          style={attached ? { background: 'rgba(210,153,34,.06)' } : undefined}
-                        >
-                          <td className="td-mono" style={{ fontSize: 11 }}>{item.fcd_id}</td>
-                          <td>{item.fcd_name}</td>
-                          <td>{item.datastore}</td>
+                        <tr key={item.fcd_id}>
                           <td>
-                            <span className={`badge ${item.capacity_gb >= 100 ? 'badge-red' : item.capacity_gb >= 20 ? 'badge-yellow' : 'badge-blue'}`}>
-                              {item.capacity_gb} GB
-                            </span>
+                            <span className={`badge ${cat.className}`} title={item.reason}>{cat.label}</span>
+                            {item.actionable && (
+                              <div style={{ fontSize: 11, color: 'var(--danger)', marginTop: 2 }}>needs investigation</div>
+                            )}
+                          </td>
+                          <td className="td-mono" style={{ fontSize: 11 }}>{item.fcd_id}</td>
+                          <td>
+                            {item.fcd_name}
+                            {item.looks_like_csi && (
+                              <span className="badge badge-gray" style={{ marginLeft: 6, fontSize: 10 }}
+                                    title="Name follows the vSphere CSI pattern (informational)">CSI name</span>
+                            )}
+                          </td>
+                          <td>{item.datastore}</td>
+                          <td>{item.capacity_gb}</td>
+                          <td>{item.claimed_by.length ? item.claimed_by.join(', ') : '—'}</td>
+                          <td><CnsCell item={item} /></td>
+                          <td><AttachedCell item={item} /></td>
+                          <td title={formatDate(item.created)}>
+                            {formatAge(item.age_hours)}
+                            {item.too_young && <span className="badge badge-blue" style={{ marginLeft: 6, fontSize: 10 }}>too young</span>}
                           </td>
                           <td
                             className="td-mono"
@@ -340,14 +415,6 @@ export default function OrphanedFCDs({ onCount }) {
                             title={item.file_path}
                           >
                             {item.file_path}
-                          </td>
-                          <td>
-                            {attached
-                              ? <span className="badge badge-yellow" title="Attached to a VM — may still be in use">{item.vm_name}</span>
-                              : <span style={{ color: 'var(--text-secondary)' }}>—</span>}
-                          </td>
-                          <td>
-                            {attached ? <PowerBadge state={item.vm_power_state} /> : <span style={{ color: 'var(--text-secondary)' }}>—</span>}
                           </td>
                         </tr>
                       )
@@ -357,16 +424,20 @@ export default function OrphanedFCDs({ onCount }) {
               </div>
             </div>
           )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 12 }}>
+            {Object.values(CATEGORIES).map(c => (
+              <div key={c.label} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
+                <span className={`badge ${c.className}`} style={{ fontSize: 11 }}>{c.label}</span>
+                {c.desc}
+              </div>
+            ))}
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+              "Needs investigation" = Candidate or Known to CNS, not attached to a VM and at least {scan.min_age_hours} hours old.
+            </div>
+          </div>
         </>
       )}
     </section>
   )
-}
-
-function PowerBadge({ state }) {
-  const s = (state || '').toLowerCase()
-  if (s === 'poweredon')  return <span className="badge badge-green">on</span>
-  if (s === 'poweredoff') return <span className="badge badge-red">off</span>
-  if (s === 'suspended')  return <span className="badge badge-yellow">suspended</span>
-  return <span className="badge badge-gray">{state || '—'}</span>
 }
