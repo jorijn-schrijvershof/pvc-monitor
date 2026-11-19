@@ -36,6 +36,12 @@ def make_snap(pvc_name: str, days_old: int) -> dict:
         "volume_handle": f"uuid-{pvc_name}",
     }
 
+
+def snap_scan(snaps, complete=True, problems=()) -> dict:
+    """The shape vcenter_client.get_snapshots() returns."""
+    return {"snapshots": list(snaps), "complete": complete, "problems": list(problems)}
+
+
 def make_disk(**over) -> dict:
     disk = {
         "fcd_id": "fcd-1", "fcd_name": "disk", "datastore": "ds1", "capacity_gb": 10.0,
@@ -300,7 +306,7 @@ class TestCheckAndAlert:
     def test_no_old_snaps_does_not_send(self):
         snaps = [make_snap("pvc1", 3)]  # 3 days — under 7-day threshold
         with patch.dict(os.environ, SMTP_ENV, clear=False), \
-             patch("vcenter_client.get_snapshots", return_value=snaps), \
+             patch("vcenter_client.get_snapshots", return_value=snap_scan(snaps)), \
              patch("alerting._send_email") as mock_send:
             result = alerting.check_and_alert()
         assert result["sent"] is False
@@ -310,7 +316,7 @@ class TestCheckAndAlert:
     def test_old_snaps_triggers_email(self):
         snaps = [make_snap("pvc1", 10)]  # 10 days — over threshold
         with patch.dict(os.environ, SMTP_ENV, clear=False), \
-             patch("vcenter_client.get_snapshots", return_value=snaps), \
+             patch("vcenter_client.get_snapshots", return_value=snap_scan(snaps)), \
              patch("alerting._send_email") as mock_send:
             result = alerting.check_and_alert()
         assert result["sent"] is True
@@ -324,7 +330,7 @@ class TestCheckAndAlert:
         def capture_send(cfg, msg):
             captured["msg"] = msg
         with patch.dict(os.environ, SMTP_ENV, clear=False), \
-             patch("vcenter_client.get_snapshots", return_value=snaps), \
+             patch("vcenter_client.get_snapshots", return_value=snap_scan(snaps)), \
              patch("alerting._send_email", side_effect=capture_send):
             result = alerting.check_and_alert()
         assert result["count"] == 1
@@ -335,7 +341,7 @@ class TestCheckAndAlert:
     def test_force_sends_even_with_no_old_snaps(self):
         snaps = [make_snap("pvc1", 2)]  # under threshold
         with patch.dict(os.environ, SMTP_ENV, clear=False), \
-             patch("vcenter_client.get_snapshots", return_value=snaps), \
+             patch("vcenter_client.get_snapshots", return_value=snap_scan(snaps)), \
              patch("alerting._send_email") as mock_send:
             result = alerting.check_and_alert(force=True)
         assert result["sent"] is True
@@ -343,7 +349,7 @@ class TestCheckAndAlert:
 
     def test_force_with_no_snaps_at_all_sends_test_email(self):
         with patch.dict(os.environ, SMTP_ENV, clear=False), \
-             patch("vcenter_client.get_snapshots", return_value=[]), \
+             patch("vcenter_client.get_snapshots", return_value=snap_scan([])), \
              patch("alerting._send_email") as mock_send:
             result = alerting.check_and_alert(force=True)
         assert result["sent"] is True
@@ -352,7 +358,7 @@ class TestCheckAndAlert:
     def test_smtp_error_captured(self):
         snaps = [make_snap("pvc1", 10)]
         with patch.dict(os.environ, SMTP_ENV, clear=False), \
-             patch("vcenter_client.get_snapshots", return_value=snaps), \
+             patch("vcenter_client.get_snapshots", return_value=snap_scan(snaps)), \
              patch("alerting._send_email", side_effect=smtplib.SMTPException("Connection refused")):
             result = alerting.check_and_alert()
         assert result["sent"] is False
@@ -373,7 +379,7 @@ class TestCheckAndAlert:
     def test_snapshot_with_unknown_age_is_alerted(self):
         snaps = [{**make_snap("pvc1", 1), "created": "not-a-date"}]
         with patch.dict(os.environ, SMTP_ENV, clear=False), \
-             patch("vcenter_client.get_snapshots", return_value=snaps), \
+             patch("vcenter_client.get_snapshots", return_value=snap_scan(snaps)), \
              patch("alerting._send_email") as mock_send:
             result = alerting.check_and_alert()
         assert result["sent"] is True and result["count"] == 1
@@ -383,7 +389,7 @@ class TestCheckAndAlert:
         assert alerting._state["last_check"] is None
         snaps = [make_snap("pvc1", 2)]
         with patch.dict(os.environ, SMTP_ENV, clear=False), \
-             patch("vcenter_client.get_snapshots", return_value=snaps), \
+             patch("vcenter_client.get_snapshots", return_value=snap_scan(snaps)), \
              patch("alerting._send_email"):
             alerting.check_and_alert()
         assert alerting._state["last_check"] is not None
@@ -391,7 +397,7 @@ class TestCheckAndAlert:
     def test_last_alert_updated_on_send(self):
         snaps = [make_snap("pvc1", 10)]
         with patch.dict(os.environ, SMTP_ENV, clear=False), \
-             patch("vcenter_client.get_snapshots", return_value=snaps), \
+             patch("vcenter_client.get_snapshots", return_value=snap_scan(snaps)), \
              patch("alerting._send_email"):
             alerting.check_and_alert()
         assert alerting._state["last_alert"] is not None
@@ -399,7 +405,7 @@ class TestCheckAndAlert:
     def test_last_alert_not_updated_when_no_send(self):
         snaps = [make_snap("pvc1", 2)]
         with patch.dict(os.environ, SMTP_ENV, clear=False), \
-             patch("vcenter_client.get_snapshots", return_value=snaps), \
+             patch("vcenter_client.get_snapshots", return_value=snap_scan(snaps)), \
              patch("alerting._send_email"):
             alerting.check_and_alert()
         assert alerting._state["last_alert"] is None
@@ -408,7 +414,7 @@ class TestCheckAndAlert:
         env = {**SMTP_ENV, "ALERT_SNAPSHOT_AGE_DAYS": "14"}
         snaps = [make_snap("pvc1", 10)]  # 10 days — under 14-day threshold
         with patch.dict(os.environ, env, clear=False), \
-             patch("vcenter_client.get_snapshots", return_value=snaps), \
+             patch("vcenter_client.get_snapshots", return_value=snap_scan(snaps)), \
              patch("alerting._send_email") as mock_send:
             result = alerting.check_and_alert()
         assert result["sent"] is False
@@ -435,7 +441,7 @@ class TestGetStatus:
     def test_status_reflects_state(self):
         snaps = [make_snap("pvc1", 10)]
         with patch.dict(os.environ, SMTP_ENV, clear=False), \
-             patch("vcenter_client.get_snapshots", return_value=snaps), \
+             patch("vcenter_client.get_snapshots", return_value=snap_scan(snaps)), \
              patch("alerting._send_email"):
             alerting.check_and_alert()
             status = alerting.get_status()
@@ -495,3 +501,103 @@ class TestCheckAndAlertOrphans:
         result, _ = self.run(error=RuntimeError("secret-host.internal"))
         assert "secret-host" not in result["error"]
         assert alerting._state_orphans["last_error"] == alerting._FETCH_ERROR
+
+
+# ── Incomplete snapshot scans ─────────────────────────────────────────────────
+
+class TestIncompleteSnapshotScan:
+    def run(self, scan, force=False):
+        with patch.dict(os.environ, SMTP_ENV, clear=False), \
+             patch("vcenter_client.get_snapshots", return_value=scan), \
+             patch("alerting._send_email") as mock_send:
+            result = alerting.check_and_alert(force=force)
+        return result, mock_send
+
+    def test_incomplete_scan_is_never_no_old_snapshots(self):
+        result, send = self.run(snap_scan([make_snap("pvc1", 2)], complete=False, problems=["Disk x: snapshots could not be read"]))
+        assert result["reason"] == "incomplete" and result["complete"] is False
+        assert alerting._state["last_error"] == alerting._SNAPSHOTS_INCOMPLETE
+        send.assert_not_called()
+
+    def test_test_mail_for_incomplete_scan_does_not_claim_none(self):
+        _, send = self.run(snap_scan([], complete=False, problems=["Disk x: snapshots could not be read"]), force=True)
+        msg = send.call_args.args[1]
+        body = html_body(msg)
+        assert "INCOMPLETE" in msg["Subject"] and "no old snapshots" not in msg["Subject"].lower()
+        assert "scan was incomplete" in body and "Disk x" in body and "no snapshots older" not in body
+
+    def test_alert_for_incomplete_scan_says_so(self):
+        result, send = self.run(snap_scan([make_snap("pvc1", 10)], complete=False, problems=["p"]))
+        assert result["sent"] is True and result["complete"] is False
+        assert "INCOMPLETE" in send.call_args.args[1]["Subject"]
+
+
+# ── Repeated failures of scheduled runs ──────────────────────────────────────
+
+class TestScheduledFailures:
+    def run(self, results, threshold="3", send_error=None):
+        """Feed scheduled runs with the given check results; return the failure e-mails sent."""
+        sent = []
+        checks = iter(results)
+
+        def check():
+            result = next(checks)
+            alerting._update(alerting._state, last_error=result.get("error"))
+            return result
+
+        def send(cfg, msg):
+            if send_error:
+                raise send_error
+            sent.append(msg)
+
+        with patch.dict(os.environ, {**SMTP_ENV, "ALERT_FAILURE_THRESHOLD": threshold}, clear=False), \
+             patch("alerting._send_email", side_effect=send):
+            for _ in results:
+                alerting._scheduled_run(check, alerting._state, "Snapshot age check")
+        return sent
+
+    FAIL = {"sent": False, "reason": "fetch_error", "error": alerting._FETCH_ERROR, "count": 0}
+    INCOMPLETE = {"sent": False, "reason": "incomplete", "count": 0, "complete": False}
+    OK = {"sent": False, "reason": "no_old_snapshots", "count": 0, "complete": True}
+
+    def test_one_mail_at_the_threshold_then_silence(self):
+        sent = self.run([self.FAIL, self.INCOMPLETE, self.FAIL, self.FAIL, self.FAIL])
+        assert len(sent) == 1
+        assert "failing or incomplete (3 runs in a row)" in sent[0]["Subject"]
+        assert alerting._FETCH_ERROR in html_body(sent[0])
+
+    def test_success_resets_and_rearms(self):
+        sent = self.run([self.FAIL, self.FAIL, self.OK, self.FAIL, self.FAIL, self.FAIL, self.OK, self.FAIL])
+        assert len(sent) == 1  # two failures, reset, three failures -> one mail
+        assert alerting._state["failures"] == 1 and alerting._state["failure_alerted"] is False
+
+    def test_threshold_one(self):
+        assert len(self.run([self.FAIL], threshold="1")) == 1
+
+    def test_failed_send_is_retried_on_the_next_failing_run(self):
+        self.run([self.FAIL, self.FAIL, self.FAIL], send_error=smtplib.SMTPException("x"))
+        assert alerting._state["failure_alerted"] is False
+        assert len(self.run([self.FAIL])) == 1
+
+    def test_threshold_must_be_at_least_one(self):
+        with patch.dict(os.environ, {**SMTP_ENV, "ALERT_FAILURE_THRESHOLD": "0"}, clear=False):
+            with pytest.raises(ConfigError, match="ALERT_FAILURE_THRESHOLD"):
+                alerting.get_config()
+
+
+def test_state_reads_and_writes_take_the_lock():
+    """get_status and state updates wait while another thread holds the state lock."""
+    import threading
+
+    with patch.dict(os.environ, SMTP_ENV, clear=False):
+        with alerting._state_lock:
+            threads = [threading.Thread(target=alerting.get_status),
+                       threading.Thread(target=alerting._update, args=(alerting._state,), kwargs={"last_count": 5})]
+            for t in threads:
+                t.start()
+                t.join(0.2)
+                assert t.is_alive()
+            assert alerting._state["last_count"] is None
+        for t in threads:
+            t.join()
+    assert alerting._state["last_count"] == 5

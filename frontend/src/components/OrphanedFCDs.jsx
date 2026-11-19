@@ -5,7 +5,7 @@ import ScanWarning from './ScanWarning'
 const CATEGORIES = {
   candidate: {
     label: 'Candidate', className: 'badge-red',
-    desc: 'Not claimed by any configured cluster and not known to CNS. Needs investigation.',
+    desc: 'Not claimed by any configured cluster and not known to CNS. Needs investigation only when the name follows the CSI pattern (pvc-<uuid>); other candidates are listed only.',
   },
   orphan_known_to_cns: {
     label: 'Known to CNS', className: 'badge-yellow',
@@ -115,7 +115,7 @@ function AttachedCell({ item }) {
     return <span className="badge badge-yellow" title={`Power: ${item.vm_power_state}`}>{item.vm_name}</span>
   }
   if (item.attached === 'unknown') {
-    return <span className="badge badge-gray" title="The VM scan was incomplete">unknown</span>
+    return <span className="badge badge-gray" title="The VM scan was incomplete or vSphere could not report the disk's VMs">unknown</span>
   }
   return <span style={{ color: 'var(--text-secondary)' }}>no</span>
 }
@@ -391,13 +391,19 @@ export default function OrphanedFCDs({ onCount }) {
                             {item.actionable && (
                               <div style={{ fontSize: 11, color: 'var(--danger)', marginTop: 2 }}>needs investigation</div>
                             )}
+                            {item.category === 'candidate' && !item.looks_like_csi && (
+                              <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 2 }}
+                                   title="Only candidates with a CSI volume name (pvc-<uuid>) are actionable">
+                                not a CSI name, listed only
+                              </div>
+                            )}
                           </td>
                           <td className="td-mono" style={{ fontSize: 11 }}>{item.fcd_id}</td>
                           <td>
                             {item.fcd_name}
                             {item.looks_like_csi && (
                               <span className="badge badge-gray" style={{ marginLeft: 6, fontSize: 10 }}
-                                    title="Name follows the vSphere CSI pattern (informational)">CSI name</span>
+                                    title="Name follows the vSphere CSI pattern; required for a candidate to be actionable">CSI name</span>
                             )}
                           </td>
                           <td>{item.datastore}</td>
@@ -433,7 +439,7 @@ export default function OrphanedFCDs({ onCount }) {
               </div>
             ))}
             <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-              "Needs investigation" = Candidate or Known to CNS, not attached to a VM and at least {scan.min_age_hours} hours old.
+              "Needs investigation" = Known to CNS, or Candidate with a CSI volume name; not attached to a VM and at least {scan.min_age_hours} hours old.
             </div>
           </div>
         </>

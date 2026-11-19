@@ -1,6 +1,7 @@
 """Tests for the app wiring in main.py: routes, headers, errors, POST guards, threading."""
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,6 +11,8 @@ import auth
 import main
 import vcenter_client
 from settings import Unavailable
+
+BACKEND = Path(__file__).resolve().parent
 
 
 @pytest.fixture
@@ -57,6 +60,27 @@ def test_security_headers(open_client):
 def test_security_headers_on_unauthenticated_responses():
     client = TestClient(main.app, base_url="https://testserver")
     assert "content-security-policy" in client.get("/api/overview").headers
+
+
+def test_security_headers_on_unhandled_errors(monkeypatch):
+    """A route that raises past every handler still gets the headers on its 500."""
+    monkeypatch.setattr(auth, "AUTH_ENABLED", False)
+    app = main.create_app()
+
+    @app.get("/api/boom")
+    def boom():
+        raise RuntimeError("unhandled")
+
+    response = TestClient(app, raise_server_exceptions=False).get("/api/boom")
+    assert response.status_code == 500
+    assert response.headers["content-security-policy"] == main._CSP
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_nginx_sends_the_app_csp_for_the_spa():
+    nginx = (BACKEND.parent / "frontend" / "nginx.conf").read_text()
+    assert f'add_header Content-Security-Policy "{main._CSP}" always;' in nginx
 
 
 def test_unexpected_error_text_not_returned(open_client, monkeypatch, caplog):

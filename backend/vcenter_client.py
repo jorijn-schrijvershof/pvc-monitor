@@ -5,6 +5,7 @@ import re
 import ssl
 import threading
 import time
+from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -53,6 +54,8 @@ VCENTER_CA_FILE = env_str("VCENTER_CA_FILE") or None  # PEM bundle for a private
 VCENTER_CACHE_SECONDS = env_int("VCENTER_CACHE_SECONDS", 60, minimum=0)
 # Socket timeout for each request to vCenter.
 VCENTER_TIMEOUT_SECONDS = 60
+# How long a caller waits for a running scan before it gets "scan in progress".
+VCENTER_SCAN_WAIT_SECONDS = env_int("VCENTER_SCAN_WAIT_SECONDS", 120, minimum=1)
 
 if not VCENTER_VERIFY_SSL:
     logger.warning(
@@ -120,13 +123,18 @@ _scan_cache: dict = {}
 def _single_flight(fn):
     @functools.wraps(fn)
     def wrapper():
-        with _scan_lock:
+        # Waiting is bounded so request threads do not pile up behind a slow scan.
+        if not _scan_lock.acquire(timeout=VCENTER_SCAN_WAIT_SECONDS):
+            raise Unavailable("A vCenter scan is in progress; try again in a minute")
+        try:
             hit = _scan_cache.get(fn.__name__)
             if hit and time.monotonic() - hit[0] < VCENTER_CACHE_SECONDS:
                 return hit[1]
             result = fn()  # failures are not cached
             _scan_cache[fn.__name__] = (time.monotonic(), result)
             return result
+        finally:
+            _scan_lock.release()
     return wrapper
 
 
@@ -168,6 +176,16 @@ _VM_SCAN_PROBLEM = "The VM scan failed or was incomplete; attachment is unknown 
 _CNS_PROBLEM = "Cloud Native Storage could not be queried; CNS state is unknown for every disk"
 _CNS_EMPTY_PROBLEM = ("Cloud Native Storage knows none of the disks that configured clusters claim; "
                       "CNS state is treated as unknown for every disk")
+_CNS_NO_VOLUMES_PROBLEM = ("Cloud Native Storage returned no volumes at all; "
+                           "CNS state is treated as unknown for every disk")
+_CNS_UNCHECKED_PROBLEM = ("No disk on the scanned datastores is claimed by a vSphere CSI PV, so the Cloud Native "
+                          "Storage answer cannot be checked; CNS state is treated as unknown for every disk")
+_ASSOC_PROBLEM = ("vSphere could not report which VMs use {count} unclaimed disk(s); "
+                  "attachment is unknown for those disks")
+_IN_TREE_PROBLEM = ("Cluster {cluster}: {count} in-tree vSphere volume PV(s) could not be matched to a First Class "
+                    "Disk by path; the claimed set is not reliable, so no unclaimed disk is categorised")
+# Disks per RetrieveVStorageObjectAssociations call.
+ASSOC_BATCH_SIZE = 100
 
 
 # ── Kubernetes claims ────────────────────────────────────────────────────────
@@ -232,6 +250,9 @@ def _build_vm_attachment_index(content) -> tuple[dict, dict, bool]:
             for vm in vm_view:
                 try:
                     if not vm.config:
+                        # No config (inaccessible VM, or no read access): its disks are unknown.
+                        logger.warning("vCenter: VM %s has no readable configuration", getattr(vm, "_moId", "?"))
+                        complete = False
                         continue
                     for device in vm.config.hardware.device:
                         if not isinstance(device, vim.vm.device.VirtualDisk):
@@ -265,13 +286,53 @@ def _build_vm_attachment_index(content) -> tuple[dict, dict, bool]:
     return obj_id_index, filepath_index, complete
 
 
-def _attachment(fcd: dict, vm_index) -> tuple[dict | None, str]:
-    """(vm_info, "yes" | "no" | "unknown"). "no" only after a complete VM scan."""
+def _attachment(fcd: dict, vm_index, associated=()) -> tuple[dict | None, str]:
+    """(vm_info, "yes" | "no" | "unknown").
+
+    associated is vSphere's own answer for this disk: the VM ids (possibly none),
+    or None when it is unknown. The default (none) lets the VM scan decide alone.
+    "yes" when either source finds a VM; "no" only after a complete VM scan AND
+    an association answer without any VM.
+    """
     obj_ids, paths, complete = vm_index
     vm = obj_ids.get(fcd["id"]) or obj_ids.get(_nodash(fcd["id"])) or paths.get(fcd["file_path"].lower())
     if vm:
         return vm, "yes"
-    return None, "no" if complete else "unknown"
+    if associated:
+        return {"vm_name": ", ".join(associated)}, "yes"
+    return None, "no" if complete and associated is not None else "unknown"
+
+
+def _query_associations(vsom, fcds: list[dict]) -> dict[str, list[str] | None]:
+    """FCD id (lower) -> ids of the VMs vSphere associates with it, or None when unknown.
+
+    Not tested against a live vCenter. Method and types come from the pyVmomi
+    9.1.1.0 type definitions (_typeinfo_vim.py): RetrieveVStorageObjectAssociations
+    on vim.vslm.vcenter.VStorageObjectManager (since vim.version.version12,
+    privilege System.View) takes RetrieveVStorageObjSpec[] (id, datastore) and
+    returns VStorageObjectAssociations[] (id, vmDiskAssociations[vmId, diskKey],
+    fault). Read-only. A disk that is missing from the answer, carries a fault, or
+    is in a batch whose call failed is reported as None, never as "no VM".
+    """
+    result: dict[str, list[str] | None] = {f["id"]: None for f in fcds}
+    for start in range(0, len(fcds), ASSOC_BATCH_SIZE):
+        batch = fcds[start:start + ASSOC_BATCH_SIZE]
+        specs = [vim.vslm.vcenter.RetrieveVStorageObjSpec(id=vim.vslm.ID(id=f["fcd_id"]), datastore=f["ds"])
+                 for f in batch]
+        try:
+            answers = vsom.RetrieveVStorageObjectAssociations(ids=specs) or []
+        except Exception:
+            logger.warning("vCenter: retrieving VM associations of %d disks failed", len(batch), exc_info=True)
+            continue
+        for answer in answers:
+            key = (getattr(getattr(answer, "id", None), "id", "") or "").lower()
+            if key not in result:
+                continue
+            if getattr(answer, "fault", None):
+                logger.warning("vCenter: VM associations of disk %s: %s", key, type(answer.fault).__name__)
+                continue
+            result[key] = sorted({a.vmId for a in getattr(answer, "vmDiskAssociations", None) or []})
+    return result
 
 
 def _log_list_failure(ds_name: str, exc: Exception) -> None:
@@ -550,7 +611,7 @@ def debug_vsphere_inventory() -> dict:
 
 
 @_single_flight
-def get_snapshots() -> list[dict]:
+def get_snapshots() -> dict:
     """
     Return FCD-level snapshots for vSphere CSI volumes.
 
@@ -560,11 +621,11 @@ def get_snapshots() -> list[dict]:
     vm.snapshot on node VMs remains None.
 
     The correct vSphere API is vsom.RetrieveSnapshotInfo(fcd_id, datastore).
-    Disks are matched to PVs by UUID only.
+    Disks are matched to PVs by UUID only. Returns {snapshots, complete, problems}.
     """
     claims = _claims()
     if not any(claims):
-        return []
+        return {"snapshots": [], "complete": True, "problems": []}
 
     with _session() as si:
         content = si.RetrieveContent()
@@ -603,10 +664,9 @@ def get_snapshots() -> list[dict]:
                         "datastore":     fcd["datastore"],
                         "storage_class": pv.get("storage_class") or "—",
                     })
-    # Snapshot scan problems are logged only; the view and the snapshot alert get the list.
     for problem in problems:
         logger.warning("vCenter: snapshot scan incomplete: %s", problem)
-    return all_snapshots
+    return {"snapshots": all_snapshots, "complete": not problems, "problems": problems}
 
 
 @_single_flight
@@ -636,36 +696,62 @@ def get_orphaned_fcds() -> dict:
                 logger.exception("vCenter: the Cloud Native Storage query failed")
                 cns_state = "failed"
                 problems.append(_CNS_PROBLEM)
+
+        # Only a CNS answer that knows at least one CSI-claimed disk may make a
+        # disk a candidate. An empty answer (for example for lack of a privilege),
+        # or one that cannot be checked, would turn every unclaimed disk into one.
+        if cns is not None:
+            csi_claimed = [f for f in fcds if f["id"] in claims[0]]
+            unchecked = (_CNS_NO_VOLUMES_PROBLEM if not cns
+                         else _CNS_UNCHECKED_PROBLEM if not csi_claimed
+                         else _CNS_EMPTY_PROBLEM if not any(f["id"] in cns for f in csi_claimed)
+                         else None)
+            if unchecked:
+                logger.warning("vCenter: %s", unchecked)
+                cns, cns_state = None, "failed"
+                problems.append(unchecked)
+
+        # An in-tree PV whose path matches no scanned disk may claim a disk the
+        # path match cannot see, so no unclaimed disk can be trusted.
+        paths = {f["file_path"].strip().lower() for f in fcds}
+        unmatched = Counter(pv["cluster"] for path, pvs in claims[1].items() if path not in paths for pv in pvs)
+        problems += [_IN_TREE_PROBLEM.format(cluster=name, count=n) for name, n in sorted(unmatched.items())]
+
+        listed = []
+        counts = {key: 0 for key in ("in_use", *CATEGORIES, "actionable")}
+        for fcd in fcds:
+            claiming = _claiming_pvs(fcd, claims)
+            cns_id = None if cns is None else cns.get(fcd["id"], False)
+            category, reason = classify(
+                [(pv["cluster"], pv.get("driver") == VSPHERE_CSI_DRIVER) for pv in claiming], cns_id, clusters,
+            )
+            if unmatched and not claiming:
+                category, reason = "unknown", "in-tree PVs could not be matched to disks, so the claimed set is not reliable"
+            counts[category] += 1
+            if category != "in_use":
+                listed.append((fcd, claiming, cns_id, category, reason))
+
+        associations = _query_associations(content.vStorageObjectManager, [item[0] for item in listed])
     if not vm_index[2]:
         problems.append(_VM_SCAN_PROBLEM)
-
-    # An answer that knows none of the CSI-claimed disks (for example an empty
-    # result for lack of a privilege) would turn every unclaimed disk into a
-    # candidate. Treat it as unknown instead.
-    if cns is not None:
-        csi_claimed = [f for f in fcds if f["id"] in claims[0]]
-        if csi_claimed and not any(f["id"] in cns for f in csi_claimed):
-            logger.warning("vCenter: CNS knows none of the %d claimed disks; treating CNS state as unknown", len(csi_claimed))
-            cns, cns_state = None, "failed"
-            problems.append(_CNS_EMPTY_PROBLEM)
+    unknown_assoc = sum(1 for a in associations.values() if a is None)
+    if unknown_assoc:
+        problems.append(_ASSOC_PROBLEM.format(count=unknown_assoc))
 
     now = datetime.now(timezone.utc)
-    counts = {key: 0 for key in ("in_use", *CATEGORIES, "actionable")}
     disks = []
-    for fcd in fcds:
-        claiming = _claiming_pvs(fcd, claims)
-        cns_id = None if cns is None else cns.get(fcd["id"], False)
-        category, reason = classify(
-            [(pv["cluster"], pv.get("driver") == VSPHERE_CSI_DRIVER) for pv in claiming], cns_id, clusters,
-        )
-        counts[category] += 1
-        if category == "in_use":
-            continue
-        vm, attached = _attachment(fcd, vm_index)
+    for fcd, claiming, cns_id, category, reason in listed:
+        vm, attached = _attachment(fcd, vm_index, associations[fcd["id"]])
         age = _age_hours(fcd["created"], now)
         too_young = None if age is None else age < UNCLAIMED_MIN_AGE_HOURS
+        looks_like_csi = bool(_CSI_NAME_RE.match(fcd["name"]))
+        # A candidate whose name is not a CSI volume name is more likely a disk of
+        # some other consumer than a leftover PV; it is listed, never actionable.
+        if category == "candidate" and not looks_like_csi:
+            reason += "; the name does not follow the CSI pattern, so it is not actionable"
         actionable = (
             category in ACTIONABLE_CATEGORIES and attached == "no" and too_young is False
+            and (category != "candidate" or looks_like_csi)
         )
         counts["actionable"] += actionable
         cns_cluster = next((c.name for c in clusters if cns_id and c.csi_cluster_id == cns_id), None)
@@ -687,7 +773,7 @@ def get_orphaned_fcds() -> dict:
             "created":        fcd["created"].isoformat() if age is not None else None,
             "age_hours":      age,
             "too_young":      too_young,
-            "looks_like_csi": bool(_CSI_NAME_RE.match(fcd["name"])),
+            "looks_like_csi": looks_like_csi,
             "actionable":     actionable,
         })
     disks.sort(key=lambda d: (not d["actionable"], -d["capacity_gb"]))

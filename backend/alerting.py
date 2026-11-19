@@ -4,6 +4,7 @@ import logging
 import os
 import smtplib
 import ssl
+import threading
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -26,6 +27,8 @@ def get_config() -> dict:
         "alert_to":             env_list("ALERT_EMAIL_TO"),
         "age_threshold_days":   env_int("ALERT_SNAPSHOT_AGE_DAYS", 7, minimum=0),
         "check_interval_hours": env_float("ALERT_CHECK_INTERVAL_HOURS", 24, minimum=1),
+        # Consecutive failed or incomplete scheduled runs before a "check failing" e-mail.
+        "failure_threshold":    env_int("ALERT_FAILURE_THRESHOLD", 3, minimum=1),
     }
 
 def is_configured(cfg: dict | None = None) -> bool:
@@ -36,15 +39,23 @@ def is_configured(cfg: dict | None = None) -> bool:
 # Fixed texts for state and API responses; the detail goes to the server log.
 _FETCH_ERROR = "inventory query failed, see the server log"
 _SMTP_ERROR  = "sending the e-mail failed, see the server log"
+_SNAPSHOTS_INCOMPLETE = "the last snapshot scan was incomplete, see the Snapshots page"
 
 
 # ── In-memory state ──────────────────────────────────────────────────────────
+#
+# Written by the scheduler thread and by request threads (test alerts, status),
+# so every access goes through _state_lock.
+
+_state_lock = threading.Lock()
 
 _state: dict = {
     "last_check": None,  # datetime
     "last_alert": None,  # datetime
     "last_count": None,  # int
     "last_error": None,  # str
+    "failures": 0,            # consecutive failed or incomplete scheduled runs
+    "failure_alerted": False,  # the "check failing" e-mail went out for this streak
 }
 
 _state_orphans: dict = {
@@ -52,10 +63,23 @@ _state_orphans: dict = {
     "last_alert": None,
     "last_count": None,
     "last_error": None,
+    "failures": 0,
+    "failure_alerted": False,
 }
+
+
+def _update(state: dict, **values) -> None:
+    with _state_lock:
+        state.update(values)
+
 
 def get_status() -> dict:
     cfg = get_config()
+    with _state_lock:
+        return _status(cfg)
+
+
+def _status(cfg: dict) -> dict:
     return {
         # Snapshot alert fields (unchanged — Snapshots.jsx reads these top-level)
         "configured":           is_configured(cfg),
@@ -95,12 +119,27 @@ def _e(value) -> str:
     return html.escape(str(value))
 
 
-def _compose_email(cfg: dict, old_snaps: list[dict], test: bool = False) -> MIMEMultipart:
+def _incomplete_block(problems) -> str:
+    items = "".join(f"<li>{_e(p)}</li>" for p in problems or [])
+    return f"""
+    <div style="background:#fdecea;border:1px solid #e0b4b4;border-radius:6px;padding:12px 16px;margin:0 0 16px">
+      <strong style="color:#c0392b">The scan was incomplete.</strong> Items may be missing from this list
+      and the absence of an item here means nothing.
+      <ul style="margin:8px 0 0;padding-left:20px">{items}</ul>
+    </div>"""
+
+
+def _compose_email(cfg: dict, old_snaps: list[dict], test: bool = False,
+                   complete: bool = True, problems=()) -> MIMEMultipart:
     threshold = cfg["age_threshold_days"]
     count = len(old_snaps)
     unknown = sum(1 for s in old_snaps if _age_days(s.get("created")) is None)
 
-    if test and count == 0:
+    if test and count == 0 and not complete:
+        subject = "[PVC Monitor] Test alert"
+        intro = ("This is a test email from PVC Monitor. No old snapshot is listed, but the result is not "
+                 "reliable; see the warning above.")
+    elif test and count == 0:
         subject = "[PVC Monitor] Test alert — no old snapshots currently"
         intro = f"This is a test email from PVC Monitor. There are currently <strong>no snapshots older than {threshold} days</strong>."
     else:
@@ -117,6 +156,9 @@ def _compose_email(cfg: dict, old_snaps: list[dict], test: bool = False) -> MIME
                 f" {unknown} of {'them have' if unknown != 1 else 'them has'} no readable "
                 "creation time; their age is <strong>unknown</strong>."
             )
+    if not complete:
+        subject += " (scan INCOMPLETE)"
+    warning = "" if complete else _incomplete_block(problems)
 
     rows = ""
     for s in sorted(old_snaps, key=lambda x: str(x.get("created") or "")):
@@ -158,9 +200,10 @@ def _compose_email(cfg: dict, old_snaps: list[dict], test: bool = False) -> MIME
 <html>
 <body style="font-family:Arial,sans-serif;color:#333;max-width:960px;margin:0 auto;padding:24px;background:#fafafa">
   <div style="background:#fff;border-radius:8px;padding:28px;border:1px solid #e0e0e0">
-    <h2 style="margin:0 0 6px;color:{'#888' if test and count == 0 else '#c0392b'}">
+    <h2 style="margin:0 0 6px;color:{'#888' if test and count == 0 and complete else '#c0392b'}">
       {'⚙ Test Alert' if test and count == 0 else '⚠ Snapshot Age Alert'}
     </h2>
+    {warning}
     <p style="margin:0 0 16px;color:#555">{intro}</p>
     {table_section}
     <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
@@ -219,39 +262,42 @@ def check_and_alert(force: bool = False) -> dict:
     import vcenter_client  # late import — avoids circular dependency at module load
 
     cfg = get_config()
-    _state["last_check"] = datetime.now(timezone.utc)
-    _state["last_error"] = None
+    _update(_state, last_check=datetime.now(timezone.utc), last_error=None)
 
     if not is_configured(cfg):
-        _state["last_error"] = "SMTP not configured"
+        _update(_state, last_error="SMTP not configured")
         return {"sent": False, "reason": "not_configured", "count": 0}
 
     try:
-        snapshots = vcenter_client.get_snapshots()
+        scan = vcenter_client.get_snapshots()
     except Exception:
         logger.exception("Alerting: snapshots, vCenter query failed")
-        _state["last_error"] = _FETCH_ERROR
+        _update(_state, last_error=_FETCH_ERROR)
         return {"sent": False, "reason": "fetch_error", "error": _FETCH_ERROR, "count": 0}
 
     # A snapshot without a readable creation time is reported, not skipped.
     threshold = cfg["age_threshold_days"]
     old_snaps = [
-        s for s in snapshots
+        s for s in scan["snapshots"]
         if (age := _age_days(s.get("created"))) is None or age >= threshold
     ]
-    _state["last_count"] = len(old_snaps)
+    complete = scan["complete"]
+    _update(_state, last_count=len(old_snaps), last_error=None if complete else _SNAPSHOTS_INCOMPLETE)
 
     if not old_snaps and not force:
-        return {"sent": False, "reason": "no_old_snapshots", "count": 0}
+        # An incomplete scan is never reported as "no old snapshots".
+        return {"sent": False, "reason": "no_old_snapshots" if complete else "incomplete",
+                "count": 0, "complete": complete}
 
     try:
-        msg = _compose_email(cfg, old_snaps, test=force and not old_snaps)
+        msg = _compose_email(cfg, old_snaps, test=force and not old_snaps,
+                             complete=complete, problems=scan["problems"])
         _send_email(cfg, msg)
-        _state["last_alert"] = datetime.now(timezone.utc)
-        return {"sent": True, "count": len(old_snaps), "recipients": cfg["alert_to"]}
+        _update(_state, last_alert=datetime.now(timezone.utc))
+        return {"sent": True, "count": len(old_snaps), "complete": complete, "recipients": cfg["alert_to"]}
     except Exception:
         logger.exception("Alerting: snapshots, sending the e-mail failed")
-        _state["last_error"] = _SMTP_ERROR
+        _update(_state, last_error=_SMTP_ERROR)
         return {"sent": False, "reason": "smtp_error", "error": _SMTP_ERROR, "count": len(old_snaps)}
 
 
@@ -296,13 +342,7 @@ def _compose_orphan_email(cfg: dict, scan: dict, test: bool = False) -> MIMEMult
       They are not listed here and may still need investigation.
     </div>"""
     if not complete:
-        problems = "".join(f"<li>{_e(p)}</li>" for p in scan.get("problems") or [])
-        warning += f"""
-    <div style="background:#fdecea;border:1px solid #e0b4b4;border-radius:6px;padding:12px 16px;margin:0 0 16px">
-      <strong style="color:#c0392b">The scan was incomplete.</strong> Disks may be missing from this list
-      and the absence of a disk here means nothing.
-      <ul style="margin:8px 0 0;padding-left:20px">{problems}</ul>
-    </div>"""
+        warning += _incomplete_block(scan.get("problems"))
 
     if count:
         intro = (
@@ -399,31 +439,27 @@ def check_and_alert_orphans(force: bool = False) -> dict:
     from settings import Unavailable
 
     cfg = get_config()
-    _state_orphans["last_check"] = datetime.now(timezone.utc)
-    _state_orphans["last_error"] = None
+    _update(_state_orphans, last_check=datetime.now(timezone.utc), last_error=None)
 
     if not is_configured(cfg):
-        _state_orphans["last_error"] = "SMTP not configured"
+        _update(_state_orphans, last_error="SMTP not configured")
         return {"sent": False, "reason": "not_configured", "count": 0}
 
     try:
         scan = vcenter_client.get_orphaned_fcds()
     except Unavailable as exc:
         logger.warning("Alerting: unclaimed disks, scan not possible: %s", exc)
-        _state_orphans["last_error"] = str(exc)  # text written by this application
+        _update(_state_orphans, last_error=str(exc))  # text written by this application
         return {"sent": False, "reason": "fetch_error", "error": str(exc), "count": 0}
     except Exception:
         logger.exception("Alerting: unclaimed disks, vCenter or Kubernetes query failed")
-        _state_orphans["last_error"] = _FETCH_ERROR
+        _update(_state_orphans, last_error=_FETCH_ERROR)
         return {"sent": False, "reason": "fetch_error", "error": _FETCH_ERROR, "count": 0}
 
     count = scan["counts"]["actionable"]
     undecided = scan["counts"]["unknown"]
-    _state_orphans["last_count"] = count
-    if not scan["complete"]:
-        _state_orphans["last_error"] = _INCOMPLETE
-    elif undecided:
-        _state_orphans["last_error"] = _UNDECIDED
+    _update(_state_orphans, last_count=count,
+            last_error=_INCOMPLETE if not scan["complete"] else _UNDECIDED if undecided else None)
 
     if not count and not force:
         if not scan["complete"]:
@@ -437,12 +473,67 @@ def check_and_alert_orphans(force: bool = False) -> dict:
     try:
         msg = _compose_orphan_email(cfg, scan, test=force and not count)
         _send_email(cfg, msg)
-        _state_orphans["last_alert"] = datetime.now(timezone.utc)
+        _update(_state_orphans, last_alert=datetime.now(timezone.utc))
         return {"sent": True, "count": count, "complete": scan["complete"], "recipients": cfg["alert_to"]}
     except Exception:
         logger.exception("Alerting: unclaimed disks, sending the e-mail failed")
-        _state_orphans["last_error"] = _SMTP_ERROR
+        _update(_state_orphans, last_error=_SMTP_ERROR)
         return {"sent": False, "reason": "smtp_error", "error": _SMTP_ERROR, "count": count}
+
+
+# ── Repeated failures of scheduled runs ──────────────────────────────────────
+
+def _compose_failure_email(cfg: dict, label: str, failures: int, reason: str | None) -> MIMEMultipart:
+    body = f"""<!DOCTYPE html>
+<html>
+<body style="font-family:Arial,sans-serif;color:#333;max-width:960px;margin:0 auto;padding:24px;background:#fafafa">
+  <div style="background:#fff;border-radius:8px;padding:28px;border:1px solid #e0e0e0">
+    <h2 style="margin:0 0 6px;color:#c0392b">{_e(label)} is failing or incomplete</h2>
+    <p style="margin:0 0 16px;color:#555">The last {_e(failures)} scheduled runs failed or were incomplete, so
+      this alert cannot be relied on. Last reason: <strong>{_e(reason)}</strong>. Details are in the server log.
+      No further e-mail about this is sent until a run succeeds.</p>
+    <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
+    <p style="margin:0;font-size:11px;color:#aaa">
+      Sent by PVC Monitor &nbsp;·&nbsp; {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+    </p>
+  </div>
+</body>
+</html>"""
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"[PVC Monitor] {label} failing or incomplete ({failures} runs in a row)"
+    msg["From"]    = cfg["smtp_from"]
+    msg["To"]      = ", ".join(cfg["alert_to"])
+    msg.attach(MIMEText(body, "html"))
+    return msg
+
+
+def _track_scheduled_result(cfg: dict, state: dict, label: str, result: dict) -> None:
+    """Count consecutive failed or incomplete scheduled runs. At the threshold,
+    e-mail once; a successful run resets the count and re-arms the e-mail."""
+    failed = result.get("reason") in ("fetch_error", "smtp_error") or result.get("complete") is False
+    with _state_lock:
+        if not failed:
+            state.update(failures=0, failure_alerted=False)
+            return
+        state["failures"] += 1
+        failures, reason = state["failures"], state["last_error"]
+        due = failures >= cfg["failure_threshold"] and not state["failure_alerted"]
+    if not due:
+        return
+    try:
+        _send_email(cfg, _compose_failure_email(cfg, label, failures, reason))
+        _update(state, failure_alerted=True)
+        logger.warning("Alerting: %s failed or was incomplete %d times in a row, e-mail sent", label, failures)
+    except Exception:
+        logger.exception("Alerting: %s, sending the failure e-mail failed", label)
+
+
+def _scheduled_run(check, state: dict, label: str) -> dict:
+    """One scheduled check, with failure tracking. Runs in a worker thread."""
+    cfg = get_config()
+    result = check()
+    _track_scheduled_result(cfg, state, label, result)
+    return result
 
 
 # ── Background scheduler ─────────────────────────────────────────────────────
@@ -462,7 +553,7 @@ async def alert_scheduler() -> None:
     while True:
         # Snapshot age alert
         try:
-            result = await asyncio.to_thread(check_and_alert)
+            result = await asyncio.to_thread(_scheduled_run, check_and_alert, _state, "Snapshot age check")
             if result.get("sent"):
                 logger.info("Alerting: snapshots — sent email for %d old snapshots", result.get("count", 0))
             elif result.get("reason") == "no_old_snapshots":
@@ -474,7 +565,8 @@ async def alert_scheduler() -> None:
 
         # Unclaimed disk alert
         try:
-            result = await asyncio.to_thread(check_and_alert_orphans)
+            result = await asyncio.to_thread(_scheduled_run, check_and_alert_orphans, _state_orphans,
+                                             "Unclaimed disk check")
             if result.get("sent"):
                 logger.info("Alerting: unclaimed disks — sent email for %d disks needing investigation (complete=%s)",
                             result.get("count", 0), result.get("complete"))

@@ -4,6 +4,8 @@ Nothing here talks to a real vCenter or cluster; the CNS query in particular is
 only checked against pyVmomi's own type definitions.
 """
 import json
+import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -26,21 +28,45 @@ OLD = NOW - timedelta(days=10)
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
 
+def csi_name(fcd_id):
+    """A name in the vSphere CSI pattern, derived from the id."""
+    return f"pvc-{uuid.uuid5(uuid.NAMESPACE_URL, fcd_id)}"
+
+
 def fcd(fcd_id, name=None, created=OLD, path=None, ds="ds1"):
     cfg = SimpleNamespace(
-        id=SimpleNamespace(id=fcd_id), name=name or f"disk-{fcd_id}", capacityInMB=2048, createTime=created,
+        id=SimpleNamespace(id=fcd_id), name=name or csi_name(fcd_id), capacityInMB=2048, createTime=created,
         backing=SimpleNamespace(filePath=path or f"[{ds}] fcd/{fcd_id}.vmdk"),
     )
     return SimpleNamespace(config=cfg)
 
 
-class FakeVCenter:
-    """content/si fakes: datastores -> FCDs, VMs, and failures to inject."""
+class FakeDatastore(vim.Datastore):
+    """A real vim.Datastore (pyVmomi type checks pass) whose name needs no vCenter."""
+    name = property(lambda self: self._moId)
 
-    def __init__(self, monkeypatch, datastores, vms=(), failing_ds=(), failing_fcds=(), vm_scan_fails=False):
-        self.destroyed, self.logouts = [], []
-        self.ds = {name: SimpleNamespace(name=name) for name in datastores}
+
+VALID = "valid-1"  # a CSI-claimed disk that CNS knows, so the CNS answer is validated
+
+
+class FakeVCenter:
+    """content/si fakes: datastores -> FCDs, VMs, associations, and failures to inject.
+
+    associations: FCD id -> VM ids that vSphere associates with the disk; ids not
+    listed have none. "fail" makes the call raise; an id mapped to "fault" gets an
+    answer with a fault; an id mapped to "missing" is left out of the answer.
+    validator adds the disk VALID to the first datastore (see the setup fixture).
+    """
+
+    def __init__(self, monkeypatch, datastores, vms=(), failing_ds=(), failing_fcds=(), vm_scan_fails=False,
+                 associations=None, validator=True):
+        self.destroyed, self.logouts, self.assoc_calls = [], [], []
+        datastores = {name: list(disks) for name, disks in datastores.items()}
+        if validator:
+            next(iter(datastores.values())).append(fcd(VALID))
+        self.ds = {name: FakeDatastore(name) for name in datastores}
         self.fcds = datastores
+        associations = associations if associations is not None else {}
         self.failing_ds, self.failing_fcds = set(failing_ds), set(failing_fcds)
 
         def view_for(types):
@@ -66,12 +92,29 @@ class FakeVCenter:
             return SimpleNamespace(snapshots=[SimpleNamespace(
                 id=SimpleNamespace(id=f"snap-of-{ref}"), createTime=OLD, description="")])
 
+        def associations_of(ids):
+            assert all(isinstance(spec, vim.vslm.vcenter.RetrieveVStorageObjSpec) for spec in ids)
+            self.assoc_calls.append([spec.id.id for spec in ids])
+            if associations == "fail":
+                raise vim.fault.NoPermission(privilegeId="System.View")
+            answers = []
+            for spec in ids:
+                vms = associations.get(spec.id.id, [])
+                if vms == "missing":
+                    continue
+                answers.append(SimpleNamespace(
+                    id=SimpleNamespace(id=spec.id.id),
+                    fault=vim.fault.NotFound() if vms == "fault" else None,
+                    vmDiskAssociations=[] if vms == "fault" else [SimpleNamespace(vmId=v, diskKey=2000) for v in vms],
+                ))
+            return answers
+
         content = SimpleNamespace(
             rootFolder=object(),
             viewManager=SimpleNamespace(CreateContainerView=lambda root, types, rec: view_for(types)),
             vStorageObjectManager=SimpleNamespace(
                 ListVStorageObject=list_fcds, RetrieveVStorageObject=retrieve,
-                RetrieveSnapshotInfo=snapshots,
+                RetrieveSnapshotInfo=snapshots, RetrieveVStorageObjectAssociations=associations_of,
             ),
         )
         self.si = SimpleNamespace(RetrieveContent=lambda: content, _stub=SimpleNamespace(cookie="c"))
@@ -107,7 +150,10 @@ CLUSTERS = [Cluster("a", "in_cluster", csi_cluster_id="id-a"),
 @pytest.fixture
 def setup(monkeypatch):
     """Configure clusters, their PVs and the CNS answer; returns a scan runner."""
-    def run(pvs=(), cns=None, clusters=CLUSTERS, cns_error=None):
+    def run(pvs=(), cns=None, clusters=CLUSTERS, cns_error=None, validated=True):
+        if validated:  # the PV and CNS entry for FakeVCenter's VALID disk
+            pvs = [*pvs, pv("a", VALID)]
+            cns = {VALID: "id-a", **(cns or {})}
         monkeypatch.setattr(k8s_client, "CLUSTERS", list(clusters))
         monkeypatch.setattr(k8s_client, "get_pvs_of_all_clusters", lambda: list(pvs))
 
@@ -242,7 +288,7 @@ def test_union_over_clusters_and_categories(monkeypatch, setup):
     assert disks["known-a"]["category"] == "orphan_known_to_cns" and disks["known-a"]["cns_cluster"] == "a"
     assert disks["foreign-1"]["category"] == "foreign" and not disks["foreign-1"]["actionable"]
     assert disks["drift-1"]["category"] == "inconsistent" and disks["drift-1"]["claimed_by"] == ["b"]
-    assert result["counts"] == {"in_use": 2, "inconsistent": 1, "orphan_known_to_cns": 1, "foreign": 1,
+    assert result["counts"] == {"in_use": 3, "inconsistent": 1, "orphan_known_to_cns": 1, "foreign": 1,
                                 "candidate": 1, "unknown": 0, "actionable": 2}
     assert result["complete"] is True and result["problems"] == []
     assert result["clusters"] == [{"name": "a", "csi_cluster_id": "id-a"}, {"name": "b", "csi_cluster_id": "id-b"}]
@@ -277,10 +323,10 @@ def test_uuid_only_matching_regression(monkeypatch, setup):
         fcd("uuid-owner", name="static-disk"),   # statically provisioned, display name is not a PV name
         fcd("uuid-tenant", name="pv-owner"),      # an FCD carrying another PV's name
         fcd("uuid-loose", name="pv-tenant"),
-    ]})
+    ]}, validator=False)
     pvs = [pv("a", "uuid-owner", name="pv-owner", claim="ns1/owner"),
            pv("a", "uuid-tenant", name="pv-tenant", claim="ns2/static-disk")]  # PVC named like the FCD
-    result = setup(pvs=pvs, cns={"uuid-owner": "id-a", "uuid-tenant": "id-a", "uuid-loose": "id-a"})
+    result = setup(pvs=pvs, cns={"uuid-owner": "id-a", "uuid-tenant": "id-a", "uuid-loose": "id-a"}, validated=False)
     assert set(by_id(result)) == {"uuid-loose"}  # named like pv-tenant, but its UUID is not claimed
 
     vcenter_client._scan_cache.clear()
@@ -289,7 +335,7 @@ def test_uuid_only_matching_regression(monkeypatch, setup):
                                                                  ("uuid-tenant", "pv-tenant")}
 
     vcenter_client._scan_cache.clear()
-    snaps = vcenter_client.get_snapshots()
+    snaps = vcenter_client.get_snapshots()["snapshots"]
     assert {(s["snapshot_id"], s["pv_name"], s["pvc_name"]) for s in snaps} == {
         ("snap-of-uuid-owner", "pv-owner", "owner"),
         ("snap-of-uuid-tenant", "pv-tenant", "static-disk"),
@@ -300,7 +346,22 @@ def test_in_tree_volume_path_counts_as_claim(monkeypatch, setup):
     FakeVCenter(monkeypatch, {"ds1": [fcd("legacy", path="[ds1] kubevols/legacy.vmdk"), fcd("other")]})
     result = setup(pvs=[pv("a", "[DS1] kubevols/legacy.vmdk", driver="kubernetes.io/vsphere-volume")], cns={})
     assert set(by_id(result)) == {"other"}
-    assert result["counts"]["in_use"] == 1
+    assert result["counts"]["in_use"] == 2
+    assert result["complete"] is True
+
+
+def test_unmatched_in_tree_pv_makes_unclaimed_disks_unknown(monkeypatch, setup):
+    FakeVCenter(monkeypatch, {"ds1": [fcd("legacy", path="[ds1] kubevols/legacy.vmdk"), fcd("x"), fcd("y")]})
+    in_tree = "kubernetes.io/vsphere-volume"
+    result = setup(pvs=[pv("a", "[ds1] kubevols/legacy.vmdk", driver=in_tree),
+                        pv("b", "[ds9] kubevols/gone-1.vmdk", driver=in_tree),
+                        pv("b", "[ds9] kubevols/gone-2.vmdk", driver=in_tree)], cns={"y": "id-a"})
+    disks = by_id(result)
+    assert set(disks) == {"x", "y"}
+    assert all(d["category"] == "unknown" and not d["actionable"] for d in disks.values())
+    assert result["counts"]["in_use"] == 2 and result["counts"]["actionable"] == 0
+    assert result["complete"] is False
+    assert result["problems"] == [vcenter_client._IN_TREE_PROBLEM.format(cluster="b", count=2)]
 
 
 def test_incomplete_datastore_and_disk_scan(monkeypatch, setup, caplog):
@@ -338,6 +399,48 @@ def test_failed_vm_scan_makes_attachment_unknown(monkeypatch, setup):
     assert vim.VirtualMachine in vc.destroyed  # the view is still destroyed
 
 
+def test_vm_without_readable_config_makes_attachment_unknown(monkeypatch, setup):
+    unreadable = SimpleNamespace(name="hidden", config=None)
+    FakeVCenter(monkeypatch, {"ds1": [fcd("x"), fcd("y")]}, vms=[unreadable, attached_vm("y")])
+    result = setup(cns={})
+    disks = by_id(result)
+    assert disks["x"]["attached"] == "unknown" and not disks["x"]["actionable"]
+    assert disks["y"]["attached"] == "yes"  # still known from the VMs that could be read
+    assert result["complete"] is False and vcenter_client._VM_SCAN_PROBLEM in result["problems"]
+
+
+def test_association_finds_a_vm_the_scan_cannot_see(monkeypatch, setup):
+    FakeVCenter(monkeypatch, {"ds1": [fcd("x"), fcd("y")]}, associations={"x": ["vm-42"]})
+    result = setup(cns={})
+    disks = by_id(result)
+    assert disks["x"]["attached"] == "yes" and disks["x"]["vm_name"] == "vm-42" and not disks["x"]["actionable"]
+    assert disks["y"]["attached"] == "no" and disks["y"]["actionable"]
+    assert result["complete"] is True
+
+
+@pytest.mark.parametrize("associations, unknown", [
+    ("fail", {"x", "y"}),
+    ({"x": "fault"}, {"x"}),
+    ({"x": "missing"}, {"x"}),
+])
+def test_unanswered_association_makes_attachment_unknown(monkeypatch, setup, associations, unknown):
+    FakeVCenter(monkeypatch, {"ds1": [fcd("x"), fcd("y")]}, associations=associations)
+    result = setup(cns={})
+    disks = by_id(result)
+    assert {d for d in disks if disks[d]["attached"] == "unknown"} == unknown
+    assert not any(disks[d]["actionable"] for d in unknown)
+    assert result["complete"] is False
+    assert vcenter_client._ASSOC_PROBLEM.format(count=len(unknown)) in result["problems"]
+
+
+def test_associations_asked_in_batches_for_listed_disks_only(monkeypatch, setup):
+    monkeypatch.setattr(vcenter_client, "ASSOC_BATCH_SIZE", 2)
+    vc = FakeVCenter(monkeypatch, {"ds1": [fcd(f"d{i}") for i in range(5)] + [fcd("claimed")]})
+    setup(pvs=[pv("a", "claimed")], cns={"claimed": "id-a"})
+    assert [len(call) for call in vc.assoc_calls] == [2, 2, 1]
+    assert sorted(i for call in vc.assoc_calls for i in call) == [f"d{i}" for i in range(5)]
+
+
 def test_attached_disk_is_not_actionable(monkeypatch, setup):
     FakeVCenter(monkeypatch, {"ds1": [fcd("x")]}, vms=[attached_vm("x")])
     disk = by_id(setup(cns={}))["x"]
@@ -359,11 +462,17 @@ def test_minimum_age(monkeypatch, setup):
     assert by_id(setup(cns={}))["young"]["actionable"]
 
 
-def test_looks_like_csi_is_informational(monkeypatch, setup):
-    FakeVCenter(monkeypatch, {"ds1": [fcd("x", name="pvc-0a1b2c3d-1111-2222-3333-444455556666"), fcd("y")]})
-    disks = by_id(setup(cns={}))
-    assert disks["x"]["looks_like_csi"] is True and disks["y"]["looks_like_csi"] is False
-    assert disks["x"]["actionable"] and disks["y"]["actionable"]
+def test_candidate_needs_a_csi_name_to_be_actionable(monkeypatch, setup):
+    FakeVCenter(monkeypatch, {"ds1": [fcd("x", name="pvc-0a1b2c3d-1111-2222-3333-444455556666"),
+                                      fcd("y", name="backup-disk"), fcd("z", name="other-disk")]})
+    result = setup(cns={"z": "id-b"})
+    disks = by_id(result)
+    assert disks["x"]["looks_like_csi"] is True and disks["x"]["actionable"]
+    assert disks["y"]["category"] == "candidate" and disks["y"]["looks_like_csi"] is False
+    assert not disks["y"]["actionable"] and "not actionable" in disks["y"]["reason"]
+    # The CSI name rule applies to candidates only.
+    assert disks["z"]["category"] == "orphan_known_to_cns" and disks["z"]["actionable"]
+    assert result["counts"]["actionable"] == 2
 
 
 def test_cns_failure_keeps_the_list_and_marks_unknown(monkeypatch, setup):
@@ -373,15 +482,26 @@ def test_cns_failure_keeps_the_list_and_marks_unknown(monkeypatch, setup):
     assert disk["category"] == "unknown" and disk["cns_known"] is None and not disk["actionable"]
     assert result["cns"] == "failed" and result["complete"] is False
     assert vcenter_client._CNS_PROBLEM in result["problems"]
-    assert result["counts"]["in_use"] == 1
+    assert result["counts"]["in_use"] == 2
 
 
-def test_cns_answer_without_any_claimed_disk_is_unknown(monkeypatch, setup):
-    """An empty CNS answer (for example a missing privilege) must not promote disks."""
-    FakeVCenter(monkeypatch, {"ds1": [fcd("x"), fcd("claimed")]})
-    result = setup(pvs=[pv("a", "claimed")], cns={})
+@pytest.mark.parametrize("pvs, cns, problem", [
+    # CNS knows none of the claimed disks (for example a missing privilege)
+    ([pv("a", "claimed")], {"elsewhere": "id-a"}, vcenter_client._CNS_EMPTY_PROBLEM),
+    # CNS returned nothing at all
+    ([pv("a", "claimed")], {}, vcenter_client._CNS_NO_VOLUMES_PROBLEM),
+    # nothing claimed on the scanned datastores to check the answer against
+    ([], {"elsewhere": "id-a"}, vcenter_client._CNS_UNCHECKED_PROBLEM),
+    ([pv("a", "claimed", driver="kubernetes.io/vsphere-volume")], {"elsewhere": "id-a"},
+     vcenter_client._CNS_UNCHECKED_PROBLEM),
+])
+def test_unvalidated_cns_answer_is_unknown(monkeypatch, setup, pvs, cns, problem):
+    """Only a CNS answer that knows a claimed disk may make a disk a candidate."""
+    FakeVCenter(monkeypatch, {"ds1": [fcd("x"), fcd("claimed")]}, validator=False)
+    result = setup(pvs=pvs, cns=cns, validated=False)
     assert by_id(result)["x"]["category"] == "unknown" and result["counts"]["actionable"] == 0
-    assert result["cns"] == "failed" and vcenter_client._CNS_EMPTY_PROBLEM in result["problems"]
+    assert result["cns"] == "failed" and result["complete"] is False
+    assert problem in result["problems"]
 
 
 def test_cns_disabled_leaves_categories_unknown(monkeypatch, setup):
@@ -390,6 +510,18 @@ def test_cns_disabled_leaves_categories_unknown(monkeypatch, setup):
     result = setup(cns_error=AssertionError("must not be called"))
     assert result["cns"] == "disabled" and by_id(result)["x"]["category"] == "unknown"
     assert result["complete"] is True
+
+
+# ── Scan lock ────────────────────────────────────────────────────────────────
+
+def test_waiting_for_a_running_scan_is_bounded(monkeypatch):
+    monkeypatch.setattr(vcenter_client, "VCENTER_SCAN_WAIT_SECONDS", 0.1)
+    vcenter_client._scan_lock.acquire()
+    try:
+        with pytest.raises(Unavailable, match="scan is in progress"):
+            vcenter_client.get_orphaned_fcds()
+    finally:
+        vcenter_client._scan_lock.release()
 
 
 # ── The CNS query against pyVmomi's own types ────────────────────────────────
@@ -474,6 +606,26 @@ def test_api_names_the_failing_cluster(monkeypatch, api):
     assert response.status_code == 503 and "'b'" in response.json()["detail"]
 
 
+@pytest.mark.parametrize("path", ["/api/orphaned-fcds", "/api/snapshots", "/api/health"])
+def test_api_answers_503_while_a_scan_holds_the_lock(monkeypatch, api, path):
+    monkeypatch.setattr(vcenter_client, "VCENTER_SCAN_WAIT_SECONDS", 0.1)
+    monkeypatch.setattr(k8s_client, "get_pvs_of_all_clusters", lambda: [])
+    vcenter_client._scan_lock.acquire()
+    try:
+        response = api.get(path)
+    finally:
+        vcenter_client._scan_lock.release()
+    assert response.status_code == 503 and "scan is in progress" in response.json()["detail"]
+
+
+def test_api_snapshots_returns_scan_object(monkeypatch, setup, api):
+    FakeVCenter(monkeypatch, {"ds1": [fcd("x")]}, failing_fcds={"x"})
+    monkeypatch.setattr(k8s_client, "get_pvs_of_all_clusters", lambda: [pv("a", VALID)])
+    body = api.get("/api/snapshots").json()
+    assert body["complete"] is False and body["problems"] == ["Datastore ds1: disk x could not be retrieved"]
+    assert [s["pv_name"] for s in body["snapshots"]] == ["pv"]
+
+
 def test_overview_reports_vsphere_failure_instead_of_idle(monkeypatch, api):
     monkeypatch.setattr(vcenter_client, "get_container_volumes", lambda: [
         {"cluster": "a", "name": "c", "namespace": "n", "pv_name": "pv", "volume_handle": "h", "status": "Bound"},
@@ -500,3 +652,28 @@ def test_overview_joins_by_cluster_and_handle(monkeypatch, api):
     ]})
     states = {v["pvc_name"]: v["usage_state"] for v in api.get("/api/overview").json()["volumes"]}
     assert states == {"c1": "active", "c2": "idle", "c3": "unknown"}  # c3: disk not found
+
+
+def test_association_query_through_pyvmomi_binding():
+    """Runs the real pyVmomi managed-object binding; only the SOAP transport is fake."""
+    def answer(fcd_id, vm_ids=(), fault=None):
+        return vim.vslm.vcenter.VStorageObjectAssociations(
+            id=vim.vslm.ID(id=fcd_id), fault=fault,
+            vmDiskAssociations=[vim.vslm.vcenter.VStorageObjectAssociations.VmDiskAssociations(vmId=v, diskKey=2000)
+                                for v in vm_ids],
+        )
+
+    calls = []
+
+    class FakeStub:
+        def InvokeMethod(self, mo, info, args):
+            calls.append((mo._moId, info.wsdlName, args[0]))
+            return [answer("A-1", ["vm-1"]), answer("b-1"), answer("c-1", fault=vim.fault.NotFound())]
+
+    vsom = vim.vslm.vcenter.VStorageObjectManager("VStorageObjectManager", FakeStub())
+    ds = FakeDatastore("ds1")
+    fcds = [{"id": i.lower(), "fcd_id": i, "ds": ds} for i in ("A-1", "b-1", "c-1", "d-1")]
+    assert vcenter_client._query_associations(vsom, fcds) == {"a-1": ["vm-1"], "b-1": [], "c-1": None, "d-1": None}
+    (mo_id, method, specs), = calls
+    assert method == "RetrieveVStorageObjectAssociations"
+    assert [(s.id.id, s.datastore) for s in specs] == [(f["fcd_id"], ds) for f in fcds]

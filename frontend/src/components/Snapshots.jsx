@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import ScanWarning from './ScanWarning'
 
 function ageDays(iso) {
   if (!iso) return null
@@ -99,6 +100,7 @@ export default function Snapshots({ onCount }) {
   onCountRef.current = onCount
 
   const [data, setData]           = useState([])
+  const [scan, setScan]           = useState(null)
   const [loading, setLoading]     = useState(true)
   const [error, setError]         = useState(null)
   const [search, setSearch]       = useState('')
@@ -117,8 +119,9 @@ export default function Snapshots({ onCount }) {
         throw new Error(err.detail || res.statusText)
       }
       const json = await res.json()
-      setData(json)
-      onCountRef.current(json.length)
+      setScan(json)
+      setData(json.snapshots)
+      onCountRef.current(json.snapshots.length)
     } catch (e) {
       setError(e.message)
     } finally {
@@ -152,10 +155,11 @@ export default function Snapshots({ onCount }) {
       } else if (data.sent) {
         setTestResult({
           ok: true,
-          msg: `Sent to ${(data.recipients || []).join(', ')} · ${data.count} old snapshot${data.count !== 1 ? 's' : ''}`,
+          msg: `Sent to ${(data.recipients || []).join(', ')} · ${data.count} old snapshot${data.count !== 1 ? 's' : ''}`
+            + (data.complete === false ? ' · scan incomplete' : ''),
         })
       } else {
-        setTestResult({ ok: false, msg: data.reason || 'Not sent' })
+        setTestResult({ ok: false, msg: data.error || data.reason || 'Not sent' })
       }
     } catch (e) {
       setTestResult({ ok: false, msg: e.message })
@@ -202,6 +206,14 @@ export default function Snapshots({ onCount }) {
       </div>
 
       <AlertPanel status={alertStatus} testResult={testResult} />
+
+      {!loading && !error && scan && !scan.complete && (
+        <ScanWarning
+          title="Incomplete scan"
+          text="Parts of vCenter could not be read. Snapshots may be missing from this list, and an old snapshot that is not listed may still exist."
+          problems={scan.problems}
+        />
+      )}
 
       {!loading && !error && (
         <div className="stats-bar">
@@ -259,7 +271,11 @@ export default function Snapshots({ onCount }) {
               {filtered.length === 0 ? (
                 <div className="empty-state">
                   <div className="empty-state-icon">📷</div>
-                  <div>{search ? 'No matching snapshots' : 'No FCD snapshots found'}</div>
+                  <div>
+                    {search ? 'No matching snapshots'
+                      : scan && !scan.complete ? 'No FCD snapshots found, but the scan above is incomplete'
+                      : 'No FCD snapshots found'}
+                  </div>
                 </div>
               ) : (
                 <table>

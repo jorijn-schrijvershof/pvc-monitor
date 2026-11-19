@@ -38,7 +38,8 @@ def _isolate(monkeypatch):
     import vcenter_client
     vcenter_client._scan_cache.clear()
     for state in (alerting._state, alerting._state_orphans):
-        state.update(last_check=None, last_alert=None, last_count=None, last_error=None)
+        state.update(last_check=None, last_alert=None, last_count=None, last_error=None,
+                     failures=0, failure_alerted=False)
     import main
     main._last_alert_test.clear()
     yield
