@@ -47,6 +47,30 @@ vcenterCA:
   secretName: ""
   key: ca.crt
 
+# Kubernetes clusters whose PersistentVolumes count as claims on vSphere disks.
+# List every cluster that uses the same vCenter; a disk of a cluster that is not
+# listed is reported as not claimed (category "foreign" or "unknown" when CNS
+# knows it). If any listed cluster cannot be read, no unclaimed-disk result is
+# produced. Remote clusters need a read-only ClusterRole for persistentvolumes,
+# persistentvolumeclaims, volumesnapshots and volumesnapshotcontents (verb list);
+# see the README.
+clusters:
+  # Display name of the cluster the application runs in (read with its own ServiceAccount).
+  localName: local
+  # cluster-id from this cluster's vSphere CSI configuration ([Global] cluster-id in
+  # csi-vsphere.conf). Needed to place disks with Cloud Native Storage.
+  localCsiClusterId: ""
+  # Existing Secret in the release namespace with one kubeconfig per key. Each
+  # kubeconfig must embed its credentials and CA (token or client certificate);
+  # exec and auth-provider plugins do not work in this image.
+  kubeconfigSecret: ""
+  # Other clusters, for example:
+  #   - name: cluster-b
+  #     kubeconfigKey: cluster-b     # key in kubeconfigSecret
+  #     context: ""                  # optional; default is the kubeconfig's current context
+  #     csiClusterId: cluster-b
+  remote: []
+
 # Credentials / app config, injected via envFrom.
 secret:
   # Use a Secret you manage yourself (must exist in the release namespace).
@@ -63,6 +87,22 @@ secret:
     VCENTER_PORT: "443"
     # Verify the vCenter certificate. Use vcenterCA for a private CA instead of disabling this.
     VCENTER_VERIFY_SSL: "true"
+    # Seconds a finished vCenter scan is reused.
+    VCENTER_CACHE_SECONDS: "60"
+    # Comma-separated datastore names to scan; empty scans every datastore the account can see.
+    VCENTER_DATASTORES: ""
+    # Query Cloud Native Storage for the cluster each disk belongs to. With "false"
+    # no unclaimed disk can be categorised (all become "unknown").
+    VCENTER_CNS_ENABLED: "true"
+    # Unclaimed disks younger than this are flagged too young and never counted as actionable.
+    UNCLAIMED_MIN_AGE_HOURS: "24"
+
+    # Kubernetes, single-cluster form only (not used when clusters.remote is set).
+    # In-cluster access needs none of these. They apply when K8S_SERVER/K8S_TOKEN or
+    # KUBECONFIG_PATH are added here; mount the referenced files yourself.
+    K8S_CONTEXT: ""
+    K8S_CA_FILE: ""
+    K8S_VERIFY_SSL: "true"
 
     # Email alerting
     SMTP_HOST: ""

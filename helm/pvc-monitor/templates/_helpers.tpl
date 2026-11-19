@@ -84,10 +84,33 @@ Render-time safety checks. Included at the top of every template so the same
 {{- if and (not .Values.serviceAccount.create) (not .Values.serviceAccount.name) -}}
 {{- fail "serviceAccount.name is required when serviceAccount.create=false; otherwise the cluster-wide read binding would go to the namespace's default ServiceAccount." -}}
 {{- end -}}
+{{- if .Values.clusters.remote -}}
+{{- if not .Values.clusters.kubeconfigSecret -}}
+{{- fail "clusters.kubeconfigSecret is required when clusters.remote is set: the Secret that holds one kubeconfig per remote cluster." -}}
+{{- end -}}
+{{- range .Values.clusters.remote -}}
+{{- if or (not .name) (not .kubeconfigKey) -}}
+{{- fail "Every entry in clusters.remote needs a name and a kubeconfigKey (the key in clusters.kubeconfigSecret)." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if and .Values.vcenterCA.configMapName .Values.vcenterCA.secretName -}}
 {{- fail "Set only one of vcenterCA.configMapName and vcenterCA.secretName." -}}
 {{- end -}}
 {{- if and .Values.networkPolicy.enabled .Values.gateway.enabled (not .Values.networkPolicy.ingressFrom) -}}
 {{- fail "networkPolicy.ingressFrom is empty while gateway.enabled=true; the Gateway could not reach the pod. Set it to the Gateway data-plane namespace/pod selector, or set networkPolicy.enabled=false." -}}
 {{- end -}}
+{{- end }}
+
+{{/*
+K8S_CLUSTERS for the application: the local cluster (in-cluster service account)
+followed by every entry of clusters.remote, each with its mounted kubeconfig.
+*/}}
+{{- define "pvc-monitor.clustersJson" -}}
+{{- $c := .Values.clusters -}}
+{{- $list := list (dict "name" $c.localName "in_cluster" true "csi_cluster_id" ($c.localCsiClusterId | default "")) -}}
+{{- range $c.remote -}}
+{{- $list = append $list (dict "name" .name "kubeconfig" (printf "/etc/pvc-monitor/kubeconfigs/%s" .kubeconfigKey) "context" (.context | default "") "csi_cluster_id" (.csiClusterId | default "")) -}}
+{{- end -}}
+{{- toJson $list -}}
 {{- end }}

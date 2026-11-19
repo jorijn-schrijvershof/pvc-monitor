@@ -36,6 +36,7 @@ spec:
 
       # No K8S_SERVER / K8S_TOKEN / KUBECONFIG_PATH -> k8s_client falls through
       # to load_incluster_config(), which reads the mounted ServiceAccount token.
+      # With clusters.remote the local cluster is an in_cluster entry of K8S_CLUSTERS.
       containers:
         - name: pvc-monitor
           image: {{ include "pvc-monitor.image" . | quote }}
@@ -47,8 +48,19 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ include "pvc-monitor.secretName" . }}
-          {{- if or .Values.forwardedAllowIps .Values.vcenterCA.configMapName .Values.vcenterCA.secretName }}
           env:
+            # Explicit env takes precedence over the Secret.
+            {{- if .Values.clusters.remote }}
+            - name: K8S_CLUSTERS
+              value: {{ include "pvc-monitor.clustersJson" . | quote }}
+            {{- else }}
+            - name: K8S_CLUSTER_NAME
+              value: {{ .Values.clusters.localName | quote }}
+            {{- with .Values.clusters.localCsiClusterId }}
+            - name: K8S_CSI_CLUSTER_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.forwardedAllowIps }}
             - name: FORWARDED_ALLOW_IPS
               value: {{ . | quote }}
@@ -57,7 +69,6 @@ spec:
             - name: VCENTER_CA_FILE
               value: {{ printf "/etc/pvc-monitor/vcenter-ca/%s" .Values.vcenterCA.key | quote }}
             {{- end }}
-          {{- end }}
 
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
@@ -99,6 +110,11 @@ spec:
               mountPath: /etc/pvc-monitor/vcenter-ca
               readOnly: true
             {{- end }}
+            {{- if .Values.clusters.remote }}
+            - name: kubeconfigs
+              mountPath: /etc/pvc-monitor/kubeconfigs
+              readOnly: true
+            {{- end }}
 
       volumes:
         - name: tmp
@@ -112,4 +128,10 @@ spec:
         - name: vcenter-ca
           secret:
             secretName: {{ .Values.vcenterCA.secretName }}
+        {{- end }}
+        {{- if .Values.clusters.remote }}
+        - name: kubeconfigs
+          secret:
+            secretName: {{ .Values.clusters.kubeconfigSecret }}
+            defaultMode: 0440
         {{- end }}
